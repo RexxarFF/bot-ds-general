@@ -137,7 +137,7 @@ REJECT_DM_TEXT = (
 
 DM_FOOTER = "FunFernus"
 SERVER_ADDRESS = "mc.funfernus.ru"
-SERVER_VERSION = "26.1"
+SERVER_VERSION = "26.1.2"
 
 
 # ============================================================
