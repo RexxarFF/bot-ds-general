@@ -9,6 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .components import build_framed_container
 from .unified_store import UnifiedDiscordStore, UnifiedState
 
 log = logging.getLogger("funfernus-government")
@@ -338,14 +339,63 @@ class CaseReviewView(discord.ui.View):
             await interaction.response.send_modal(RejectModal(self.bot, self.store, case_id))
 
 
-class ClaimPanelView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
+class ClaimPanelView(discord.ui.LayoutView):
+    """Публичная панель правительства с большим баннером сверху."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        state: UnifiedState | None = None,
+    ) -> None:
         super().__init__(timeout=None)
         self.bot = bot
         self.store = store
 
-    @discord.ui.button(label="Подать иск", emoji="⚖️", style=discord.ButtonStyle.primary, custom_id="unified:government:claim")
-    async def claim(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        panel_state = state or UnifiedState()
+        action_row = discord.ui.ActionRow()
+        claim_button = discord.ui.Button(
+            label="Подать иск",
+            emoji="⚖️",
+            style=discord.ButtonStyle.primary,
+            custom_id="unified:government:claim",
+        )
+        claim_button.callback = self._claim
+        action_row.add_item(claim_button)
+
+        description = panel_state.texts.get(
+            "government_description",
+            "Нажмите кнопку ниже.",
+        ).strip()
+        preparation = (
+            "**Подготовьте:**\n"
+            "• Minecraft-ник ответчика\n"
+            "• Discord ответчика\n"
+            "• описание ситуации\n"
+            "• требования\n"
+            "• доказательства"
+        )
+        body = f"{description}\n\n{preparation}" if description else preparation
+        asset = panel_state.asset("government_panel")
+
+        self.add_item(
+            build_framed_container(
+                title=panel_state.texts.get(
+                    "government_title",
+                    "Подача судебного иска",
+                ),
+                body=body,
+                banner_url=asset.url,
+                color=int(panel_state.options.get("accent_color", 0x19B9D1)),
+                footer=panel_state.texts.get(
+                    "government_footer",
+                    "FunFernus • Правительство",
+                ),
+                action_row=action_row,
+            )
+        )
+
+    async def _claim(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(ClaimModal(self.bot, self.store))
 
 
@@ -354,25 +404,23 @@ async def publish_government_panel(bot: commands.Bot, store: UnifiedDiscordStore
     review = await _channel(bot, state.channels.get("government_review", 0))
     if channel is None or review is None:
         return False, "Сначала выберите канал подачи и канал рассмотрения."
-    embed = discord.Embed(
-        title=state.texts.get("government_title", "Подача судебного иска"),
-        description=state.texts.get("government_description", "Нажмите кнопку ниже."),
-        color=int(state.options.get("accent_color", 0x19B9D1)),
-    )
-    asset = state.asset("government_panel")
-    if asset.url:
-        embed.set_image(url=asset.url)
-    embed.add_field(name="Подготовьте", value="• Minecraft-ник ответчика\n• Discord ответчика\n• описание ситуации\n• требования\n• доказательства", inline=False)
-    embed.set_footer(text=state.texts.get("government_footer", "FunFernus • Правительство"))
+
+    panel_view = ClaimPanelView(bot, store, state)
     old = state.messages.get("government_panel", 0)
     if old:
         try:
             message = await channel.fetch_message(old)
-            await message.edit(embed=embed, view=ClaimPanelView(bot, store))
+            await message.edit(
+                content=None,
+                embeds=[],
+                attachments=[],
+                view=panel_view,
+            )
             return True, "Панель правительства обновлена."
         except discord.HTTPException:
             pass
-    message = await channel.send(embed=embed, view=ClaimPanelView(bot, store))
+
+    message = await channel.send(view=panel_view)
     state.messages["government_panel"] = message.id
     await store.save(state)
     return True, "Панель правительства опубликована."
