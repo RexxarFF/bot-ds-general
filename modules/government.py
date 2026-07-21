@@ -370,11 +370,13 @@ async def publish_government_panel(bot: commands.Bot, store: UnifiedDiscordStore
 
     embed.add_field(
         name="Подготовьте перед подачей",
-        value="• Minecraft-ник ответчика
-• Discord ответчика
-• подробное описание ситуации
-• ваши требования
-• доказательства: скриншоты, файлы, ссылки",
+        value=(
+            "• Minecraft-ник ответчика\n"
+            "• Discord ответчика\n"
+            "• подробное описание ситуации\n"
+            "• ваши требования\n"
+            "• доказательства: скриншоты, файлы, ссылки"
+        ),
         inline=False,
     )
     embed.set_footer(text=state.texts.get("government_footer", "FunFernus • Правительство"))
