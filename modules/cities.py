@@ -1093,6 +1093,84 @@ async def _user(bot: commands.Bot, user_id: int) -> discord.User | None:
         return None
 
 
+def _has_city_invitation_buttons(items: Iterable[Any]) -> bool:
+    """Return whether a Components V2 tree contains an active city invitation."""
+    for item in items:
+        if getattr(item, "custom_id", "") in {
+            "unified:cities:invitation:accept",
+            "unified:cities:invitation:decline",
+        }:
+            return True
+        children = getattr(item, "children", None)
+        if children and _has_city_invitation_buttons(children):
+            return True
+    return False
+
+
+async def _delete_invitation_dm(bot: commands.Bot, invitation: dict[str, Any]) -> bool:
+    """Delete a cancelled invitation, including legacy cards with a lost ID."""
+    user_id = int(invitation.get("userId", invitation.get("user_id", 0)) or 0)
+    message_id = int(invitation.get("dmMessageId", invitation.get("dm_message_id", 0)) or 0)
+    if not user_id:
+        return False
+    recipient = await _user(bot, user_id)
+    if recipient is None:
+        return False
+    try:
+        channel = recipient.dm_channel or await recipient.create_dm()
+    except (discord.Forbidden, discord.HTTPException):
+        log.warning("Не удалось открыть ЛС с пользователем %s для удаления приглашения", user_id)
+        return False
+
+    stored_message_missing = False
+    if message_id:
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.delete()
+            return True
+        except discord.NotFound:
+            # The stored ID may belong to an old message after a bot update.
+            # Continue with a safe component-based lookup below.
+            stored_message_missing = True
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("Не удалось удалить ЛС-приглашение %s для пользователя %s", message_id, user_id)
+
+    # Old invitations may not have dmMessageId in JSON.  There can be only one
+    # active invitation per player, so deleting bot messages with its active
+    # accept/decline controls is a safe recovery path.
+    deleted = False
+    try:
+        async for message in channel.history(limit=100, oldest_first=False):
+            if bot.user is None or message.author.id != bot.user.id:
+                continue
+            if not _has_city_invitation_buttons(getattr(message, "components", []) or []):
+                continue
+            await message.delete()
+            deleted = True
+    except (discord.Forbidden, discord.HTTPException):
+        log.warning("Не удалось найти или удалить старое ЛС-приглашение для пользователя %s", user_id)
+        return False
+
+    # If the exact saved message was already absent, there is nothing left to
+    # delete even when the fallback does not find a duplicate.
+    return deleted or stored_message_missing
+
+
+def _city_invitation_embed(city: dict[str, Any], invited_by: int) -> discord.Embed:
+    """Build the player-facing invitation without exposing the internal city ID."""
+    return _simple_embed(
+        "🏰 Приглашение в город",
+        (
+            f"Вас приглашают вступить в город **{city.get('name', 'город')}**.\n\n"
+            f"**Мэр:** <@{_mayor_id(city)}>\n"
+            f"**Приглашение отправил:** <@{invited_by}>\n\n"
+            "Вы станете горожанином только после нажатия кнопки **«Вступить в город»**."
+        ),
+        color=0x5865F2,
+        footer="FunFernus • Приглашение в город",
+    )
+
+
 async def _send_city_log(
     bot: commands.Bot,
     state: UnifiedState,
@@ -1217,7 +1295,9 @@ def city_registry_embed(city_id: str, city: dict[str, Any], state: UnifiedState)
         value="Мэр, заместитель мэра, настроенная администрация и разрешённые боты. Остальные сообщения удаляются автоматически.",
         inline=False,
     )
-    embed.set_footer(text=f"Официальный реестр FunFernus • ID города: {city_id}")
+    # Реестр доступен обычным участникам, поэтому внутренний ID сюда не выводим.
+    # Он остаётся в карточке рассмотрения и служебном канале логов.
+    embed.set_footer(text="Официальный реестр FunFernus")
     return embed
 
 
@@ -1233,7 +1313,6 @@ def city_management_embed(city_id: str, city: dict[str, Any], state: UnifiedStat
         color=accent,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="ID города", value=f"`{city_id}`", inline=True)
     embed.add_field(name="Мэр", value=_leader_text(city, "mayor"), inline=True)
     embed.add_field(name="Заместитель", value=_leader_text(city, "deputy"), inline=True)
     embed.add_field(name="Стиль", value=_trim(city.get("style"), 500), inline=False)
@@ -1270,12 +1349,16 @@ async def _send_screenshot_message(
     city: dict[str, Any],
     *,
     context: str,
+    include_city_id: bool = False,
 ) -> discord.Message | None:
     files = _local_screenshot_files(city)
     if not files:
         return None
+    label = f"{_trim(city.get('name', 'Город'), 180)} • {context}"
+    if include_city_id:
+        label += f" • {city_id}"
     return await channel.send(
-        content=f"📸 **Скриншоты города `{city_id}` • {context}**",
+        content=f"📸 **Скриншоты города • {label}**",
         files=files,
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -1288,6 +1371,7 @@ async def _edit_screenshot_message(
     city: dict[str, Any],
     *,
     context: str,
+    include_city_id: bool = False,
 ) -> tuple[discord.Message | None, str]:
     files = _local_screenshot_files(city)
     if not files:
@@ -1299,11 +1383,15 @@ async def _edit_screenshot_message(
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
         return None, "Скриншотов нет."
+    label = f"{_trim(city.get('name', 'Город'), 180)} • {context}"
+    if include_city_id:
+        label += f" • {city_id}"
+    content = f"📸 **Скриншоты города • {label}**"
     if message_id and hasattr(channel, "fetch_message"):
         try:
             message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
             edited = await message.edit(
-                content=f"📸 **Скриншоты города `{city_id}` • {context}**",
+                content=content,
                 attachments=files,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -1316,7 +1404,7 @@ async def _edit_screenshot_message(
             return None, f"Discord не обновил скриншоты: {exc}"
     try:
         message = await channel.send(
-            content=f"📸 **Скриншоты города `{city_id}` • {context}**",
+            content=content,
             files=files,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -1668,6 +1756,61 @@ async def sync_registry_post(
         return False, f"Discord не обновил карточку реестра: {exc}"
 
 
+async def _migrate_public_city_id_visibility(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    state: UnifiedState,
+) -> None:
+    """Rewrite existing public cards and active invitation DMs once after the privacy update."""
+    migration_key = "city_public_id_visibility_migrated_v1"
+    if state.options.get(migration_key):
+        return
+
+    failed_city_ids: set[str] = set()
+    for city_id, city in state.cities.items():
+        if city.get("status") != "approved":
+            continue
+        synced, _ = await sync_registry_post(bot, state, city_id, city)
+        # A city without an existing registry post has no public text to clean.
+        if not synced and _get_message_id(city, "registryThreadId", "registry_thread_id"):
+            failed_city_ids.add(city_id)
+
+        for invitation in _pending_invitations(city):
+            message_id = int(invitation.get("dmMessageId", 0) or 0)
+            if not message_id:
+                continue
+            recipient = await _user(bot, int(invitation.get("userId", 0) or 0))
+            if recipient is None:
+                failed_city_ids.add(city_id)
+                continue
+            try:
+                channel = recipient.dm_channel or await recipient.create_dm()
+                message = await channel.fetch_message(message_id)
+                await _edit_message_card(
+                    message,
+                    kind="notification",
+                    embed=_city_invitation_embed(city, int(invitation.get("invitedBy", 0) or 0)),
+                    state=state,
+                    city=city,
+                    view=CityInvitationView(bot, store),
+                )
+            except discord.NotFound:
+                # The old player-facing message is already gone.
+                pass
+            except (discord.Forbidden, discord.HTTPException):
+                failed_city_ids.add(city_id)
+
+    if failed_city_ids:
+        log.warning(
+            "Не удалось обновить карточки городов без ID: %s",
+            ", ".join(sorted(failed_city_ids)),
+        )
+        return
+
+    state.options[migration_key] = True
+    await store.save(state)
+
+
 async def create_registry_post(
     bot: commands.Bot,
     state: UnifiedState,
@@ -1799,7 +1942,7 @@ class CityDetailsModal(discord.ui.Modal):
                 interaction,
                 kind="warning",
                 title="❌ Вы уже состоите в городе",
-                description=f"Ваш Discord ID уже связан с городом `{occupied[0]}`.",
+                description="Ваш Discord ID уже связан с другим городом.",
                 state=state,
             )
             return
@@ -2042,6 +2185,7 @@ class CityScreenshotsModal(discord.ui.Modal):
                 city_id,
                 city,
                 context="материалы заявки",
+                include_city_id=True,
             )
             _set_message_id(city, "reviewMessageId", "review_message_id", main_message.id)
             _set_message_id(
@@ -2100,7 +2244,7 @@ class CityScreenshotsModal(discord.ui.Modal):
             kind="notification",
             title="✅ Заявка отправлена",
             description=(
-                f"Заявка `{city_id}` передана администрации. Основная карточка и скриншоты отправлены "
+                "Заявка передана администрации. Основная карточка и скриншоты отправлены "
                 "двумя отдельными сообщениями без URL-адресов изображений."
             ),
             state=state,
@@ -2391,7 +2535,7 @@ class CityReviewView(discord.ui.View):
                     f"Вам выдана роль **{mayor_role.name}**, а публикация создана в <#{thread.id}>."
                 ),
                 color=0x59B77A,
-                footer=f"FunFernus • {city_id}",
+                footer="FunFernus • Регистрация города",
             )
             dm_failures: list[str] = []
             try:
@@ -2404,7 +2548,7 @@ class CityReviewView(discord.ui.View):
                 interaction,
                 kind="notification",
                 title="✅ Город одобрен",
-                description=f"Город `{city_id}` опубликован в <#{thread.id}>.{tail}",
+                description=f"Город опубликован в <#{thread.id}>.{tail}",
                 state=state,
                 city=city,
                 followup=True,
@@ -2537,7 +2681,7 @@ class CityRejectModal(discord.ui.Modal):
                     "❌ Регистрация города отклонена",
                     f"Заявка города **{city.get('name')}** отклонена.\n\n**Причина:**\n{str(self.reason).strip()}",
                     color=0xD85C5C,
-                    footer=f"FunFernus • {self.city_id}",
+                    footer="FunFernus • Регистрация города",
                 )
                 try:
                     await _send_user_card(mayor, kind="warning", embed=dm, state=state, city=city)
@@ -2642,12 +2786,12 @@ class CityQuestionModal(discord.ui.Modal):
                 dm = _simple_embed(
                     "❓ Вопрос по заявке города",
                     (
-                        f"Администрация задала вопрос по заявке **{city.get('name')}** (`{self.city_id}`).\n\n"
+                        f"Администрация задала вопрос по заявке **{city.get('name')}**.\n\n"
                         f"**Вопрос:**\n{question}\n\n"
                         "Ответьте следующим сообщением в этом личном чате. Файлы можно приложить — бот сохранит их локально."
                     ),
                     color=0x5865F2,
-                    footer=f"FunFernus • {self.city_id}",
+                    footer="FunFernus • Заявка на город",
                 )
                 await _send_user_card(mayor, kind="notification", embed=dm, state=state, city=city)
             except Exception as exc:
@@ -3050,7 +3194,7 @@ def city_citizens_embed(
             lines.append(f"{index}. **{_trim(display, 55)}** • <@{user_id}> — `{user_id}` • {status}")
         embed.add_field(name="Список горожан", value=_trim("\n".join(lines), 4000), inline=False)
     embed.set_footer(
-        text=f"FunFernus • {city_id} • Страница {page + 1}/{page_count} • Лимит: {MAX_CITY_CITIZENS}"
+        text=f"FunFernus • Страница {page + 1}/{page_count} • Лимит: {MAX_CITY_CITIZENS}"
     )
     return embed
 
@@ -3156,6 +3300,20 @@ class CityInvitationView(discord.ui.View):
                 return state, city_id, city, invitation
         return None
 
+    async def _delete_stale_message(self, interaction: discord.Interaction) -> None:
+        """A withdrawn invitation must not turn into another banner on click."""
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        message = interaction.message
+        if message is None:
+            return
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("Не удалось удалить устаревшее ЛС-приглашение %s", message.id)
+
     async def _finish_message(
         self,
         interaction: discord.Interaction,
@@ -3189,12 +3347,7 @@ class CityInvitationView(discord.ui.View):
     async def accept(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         resolved = self._resolve(interaction)
         if resolved is None:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Приглашение недействительно",
-                description="Оно уже принято, отклонено, отменено мэром или город был удалён.",
-            )
+            await self._delete_stale_message(interaction)
             return
         state, city_id, city, invitation = resolved
         await interaction.response.defer()
@@ -3228,7 +3381,7 @@ class CityInvitationView(discord.ui.View):
             await self._finish_message(
                 interaction,
                 title="❌ Вступление отменено",
-                description=f"Ваш Discord ID уже связан с другим городом `{occupied[0]}`.",
+                description="Ваш Discord ID уже связан с другим городом.",
                 state=state,
                 city=city,
                 color=0xD85C5C,
@@ -3306,7 +3459,7 @@ class CityInvitationView(discord.ui.View):
         await self._finish_message(
             interaction,
             title="✅ Вы вступили в город",
-            description=f"Вы приняты в **{city.get('name', city_id)}** (`{city_id}`).",
+            description=f"Вы приняты в **{city.get('name', city_id)}**.",
             state=state,
             city=city,
             color=0x59B77A,
@@ -3321,12 +3474,7 @@ class CityInvitationView(discord.ui.View):
     async def decline(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         resolved = self._resolve(interaction)
         if resolved is None:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Приглашение недействительно",
-                description="Оно уже обработано или отменено.",
-            )
+            await self._delete_stale_message(interaction)
             return
         state, city_id, city, invitation = resolved
         await interaction.response.defer()
@@ -3426,7 +3574,7 @@ class CityCitizenAddSelect(discord.ui.UserSelect):
                 interaction,
                 kind="warning",
                 title="❌ Игрок состоит в другом городе",
-                description=f"Его Discord ID уже связан с городом `{other[0]}`.",
+                description="Его Discord ID уже связан с другим городом.",
                 state=state,
                 city=city,
             )
@@ -3437,7 +3585,7 @@ class CityCitizenAddSelect(discord.ui.UserSelect):
                 interaction,
                 kind="warning",
                 title="❌ Приглашение уже отправлено",
-                description=f"У игрока уже есть активное приглашение от города `{existing_invite[0]}`.",
+                description="У игрока уже есть активное приглашение от другого города.",
                 state=state,
                 city=city,
             )
@@ -3471,17 +3619,7 @@ class CityCitizenAddSelect(discord.ui.UserSelect):
             "dmMessageId": 0,
             "status": "pending",
         }
-        invite_embed = _simple_embed(
-            "🏰 Приглашение в город",
-            (
-                f"Вас приглашают вступить в город **{city.get('name', self.city_id)}** (`{self.city_id}`).\n\n"
-                f"**Мэр:** <@{_mayor_id(city)}>\n"
-                f"**Приглашение отправил:** <@{interaction.user.id}>\n\n"
-                "Вы станете горожанином только после нажатия кнопки **«Вступить в город»**."
-            ),
-            color=0x5865F2,
-            footer=f"FunFernus • Приглашение • {self.city_id}",
-        )
+        invite_embed = _city_invitation_embed(city, interaction.user.id)
         await interaction.response.defer(ephemeral=True, thinking=True)
         dm_message: discord.Message | None = None
         try:
@@ -3567,7 +3705,7 @@ def city_invitations_embed(
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name=f"Активные приглашения • {len(invitations)}", value=_pending_invitation_preview(city), inline=False)
-    embed.set_footer(text=f"FunFernus • {city_id} • Управление приглашениями")
+    embed.set_footer(text="FunFernus • Управление приглашениями")
     return embed
 
 
@@ -3645,6 +3783,16 @@ class CityInvitationCancelSelect(discord.ui.Select):
                 city=previous,
             )
             return
+        undeleted_dm_user_ids = [
+            int(item.get("userId", 0))
+            for item in removed
+            if not await _delete_invitation_dm(self.bot, item)
+        ]
+        if undeleted_dm_user_ids:
+            log.warning(
+                "Отменённые приглашения сохранены, но не все ЛС удалены: %s",
+                ", ".join(str(user_id) for user_id in undeleted_dm_user_ids),
+            )
         removed_mentions = ", ".join(
             f"<@{int(item.get('userId', 0))}>" for item in removed
         )
@@ -3662,12 +3810,18 @@ class CityInvitationCancelSelect(discord.ui.Select):
         )
         await _send_interaction_card(
             interaction,
-            kind="notification",
-            title="✅ Приглашения отменены",
-            description=f"Отменено приглашений: **{len(removed)}**.",
+            kind="warning" if undeleted_dm_user_ids else "notification",
+            title="⚠️ Приглашения отменены не полностью" if undeleted_dm_user_ids else "✅ Приглашения отменены",
+            description=(
+                "Приглашения отменены, но бот не смог удалить ЛС у: "
+                + ", ".join(f"<@{user_id}>" for user_id in undeleted_dm_user_ids)
+                + ". Проверьте права бота и повторите отмену."
+                if undeleted_dm_user_ids
+                else f"Отменено приглашений: **{len(removed)}**."
+            ),
             state=state,
             city=city,
-            color=0x59B77A,
+            color=0xF2B84B if undeleted_dm_user_ids else 0x59B77A,
         )
 
 
@@ -4388,7 +4542,7 @@ async def _send_leadership_service_message(
             f"**Изменение выполнил:** <@{moderator_id}> (`{moderator_id}`)"
         ),
         color=0x5865F2,
-        footer=f"FunFernus • {city_id} • Служебное сообщение",
+        footer="FunFernus • Служебное сообщение",
     )
     try:
         await _send_channel_card(thread, kind="leadership", embed=embed, state=state, city=city)
@@ -4747,6 +4901,7 @@ async def publish_city_panels(
         if run_audit:
             await _migrate_legacy_city_assets(bot, store, guild, state)
             await _audit_city_state(bot, store, guild, state, admin_ids)
+            await _migrate_public_city_id_visibility(bot, store, state)
 
         return await _publish_city_panels_locked(
             bot,
@@ -6170,7 +6325,7 @@ async def _handle_city_question_dm(
             try:
                 confirmation = _simple_embed(
                     "✅ Ответ передан администрации",
-                    f"Ваш ответ по заявке `{city_id}` сохранён. Вложения переданы отдельным сообщением без URL.",
+                    "Ваш ответ по заявке сохранён. Вложения переданы отдельным сообщением без URL.",
                     color=0x59B77A,
                 )
                 await _send_user_card(message.author, kind="notification", embed=confirmation, state=state, city=city)
@@ -6251,7 +6406,7 @@ async def _handle_city_thread_message(
             "настроенная администрация и разрешённые боты. Проверка выполняется по Discord ID."
         ),
         color=0xD85C5C,
-        footer=f"FunFernus • {city_id}",
+        footer="FunFernus • Публикация города",
     )
     try:
         await _send_user_card(message.author, kind="warning", embed=warning, state=state, city=city)
@@ -6618,7 +6773,7 @@ async def _delete_city_everywhere(
             notice = _simple_embed(
                 "🗑️ Город удалён из реестра",
                 (
-                    f"Город **{snapshot.get('name', normalized_id)}** (`{normalized_id}`) удалён администрацией.\n"
+                    f"Город **{snapshot.get('name', normalized_id)}** удалён администрацией.\n"
                     "Публикация реестра, карточка заявки и сохранённые материалы больше не используются."
                 ),
                 color=0xD85C5C,
