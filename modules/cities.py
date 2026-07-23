@@ -303,13 +303,21 @@ def _pending_invitation_preview(city: dict[str, Any], *, limit: int = 10) -> str
     return _trim("\n".join(lines), 1024)
 
 
-def _citizen_preview(city: dict[str, Any], *, limit: int = 15) -> str:
+def _citizen_preview(
+    city: dict[str, Any],
+    *,
+    limit: int = 15,
+    include_ids: bool = False,
+) -> str:
     citizens = _citizen_ids(city)
     if not citizens:
         return "Горожане пока не добавлены."
     absent = _citizen_absent_ids(city)
     lines = [
-        f"{index}. <@{user_id}> — `{user_id}`" + (" • ⚠️ покинул сервер" if user_id in absent else "")
+        (
+            f"{index}. <@{user_id}>" + (f" — `{user_id}`" if include_ids else "")
+            + (" • ⚠️ покинул сервер" if user_id in absent else "")
+        )
         for index, user_id in enumerate(citizens[:limit], 1)
     ]
     if len(citizens) > limit:
@@ -926,12 +934,16 @@ def _status_color(status: str, accent: int) -> int:
     }.get(status, accent)
 
 
-def _leader_text(city: dict[str, Any], leader: str) -> str:
+def _leader_text(city: dict[str, Any], leader: str, *, include_id: bool = False) -> str:
     user_id = _mayor_id(city) if leader == "mayor" else _deputy_id(city)
     present = bool(city.get(f"{leader}Present", city.get(f"{leader}_present", True)))
     if not user_id:
         return "Не назначен"
-    return f"<@{user_id}>\n`ID: {user_id}`" + ("" if present else "\n⚠️ Покинул сервер")
+    return (
+        f"<@{user_id}>"
+        + (f"\n`ID: {user_id}`" if include_id else "")
+        + ("" if present else "\n⚠️ Покинул сервер")
+    )
 
 
 def _registry_status(city: dict[str, Any]) -> str:
@@ -1231,8 +1243,8 @@ def city_review_embed(city_id: str, city: dict[str, Any], state: UnifiedState) -
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Название", value=_trim(city.get("name")), inline=True)
-    embed.add_field(name="Мэр", value=_leader_text(city, "mayor"), inline=True)
-    embed.add_field(name="Заместитель", value=_leader_text(city, "deputy"), inline=True)
+    embed.add_field(name="Мэр", value=_leader_text(city, "mayor", include_id=True), inline=True)
+    embed.add_field(name="Заместитель", value=_leader_text(city, "deputy", include_id=True), inline=True)
     embed.add_field(name="Архитектурный стиль", value=_trim(city.get("style")), inline=False)
     embed.add_field(name="Координаты • Верхний мир", value=_trim(city.get("overworld_coords")), inline=True)
     embed.add_field(name="Координаты • Нижний мир", value=_trim(city.get("nether_coords")), inline=True)
@@ -1252,7 +1264,11 @@ def city_review_embed(city_id: str, city: dict[str, Any], state: UnifiedState) -
         embed.add_field(name="Ответ мэра", value=_trim(latest.get("answer"), 700, "Ответ ещё не получен."), inline=False)
 
     if status == "approved":
-        embed.add_field(name=f"Горожане • {len(_citizen_ids(city))}", value=_citizen_preview(city), inline=False)
+        embed.add_field(
+            name=f"Горожане • {len(_citizen_ids(city))}",
+            value=_citizen_preview(city, include_ids=True),
+            inline=False,
+        )
         embed.add_field(name="Одобрил", value=f"<@{int(city.get('reviewer_id', 0))}>", inline=True)
         thread_id = _get_message_id(city, "registryThreadId", "registry_thread_id")
         if thread_id:
@@ -1761,8 +1777,9 @@ async def _migrate_public_city_id_visibility(
     store: UnifiedDiscordStore,
     state: UnifiedState,
 ) -> None:
-    """Rewrite existing public cards and active invitation DMs once after the privacy update."""
-    migration_key = "city_public_id_visibility_migrated_v1"
+    """Rewrite existing public cards and DMs once after the privacy updates."""
+    # v2 additionally removes public Discord user IDs from city forum cards.
+    migration_key = "city_public_personal_id_visibility_migrated_v2"
     if state.options.get(migration_key):
         return
 
@@ -4531,15 +4548,17 @@ async def _send_leadership_service_message(
     label = "мэра" if leader_type == "mayor" else "заместителя мэра"
     actor_is_mayor = moderator_id == _mayor_id(city) and leader_type == "deputy"
     actor_label = "Мэр изменил" if actor_is_mayor else "Администрация изменила"
-    old_text = f"<@{old_id}> (`{old_id}`)" if old_id else "Не был назначен"
-    new_text = f"<@{new_id}> (`{new_id}`)" if new_id else "Не назначен"
+    # Сообщение публикуется в форуме, поэтому показываем пользователей без
+    # технических Discord ID.
+    old_text = f"<@{old_id}>" if old_id else "Не был назначен"
+    new_text = f"<@{new_id}>" if new_id else "Не назначен"
     embed = _simple_embed(
         "🔄 Изменение руководства города",
         (
             f"{actor_label} {label} города **{city.get('name', city_id)}**.\n\n"
             f"**Предыдущий руководитель:** {old_text}\n"
             f"**Новый руководитель:** {new_text}\n"
-            f"**Изменение выполнил:** <@{moderator_id}> (`{moderator_id}`)"
+            f"**Изменение выполнил:** <@{moderator_id}>"
         ),
         color=0x5865F2,
         footer="FunFernus • Служебное сообщение",
