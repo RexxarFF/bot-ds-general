@@ -113,6 +113,19 @@ def _city_id(message: discord.Message | None) -> str:
             values.append(embed.title)
         if embed.footer and embed.footer.text:
             values.append(embed.footer.text)
+
+    # Components V2 не используют обычные embeds/content. ID города хранится
+    # в TextDisplay карточки, поэтому рекурсивно просматриваем компоненты.
+    def collect_components(items: Iterable[Any]) -> None:
+        for item in items:
+            content = getattr(item, "content", None)
+            if content:
+                values.append(str(content))
+            children = getattr(item, "children", None)
+            if children:
+                collect_components(children)
+
+    collect_components(getattr(message, "components", []) or [])
     for value in values:
         match = CITY_ID_RE.search(value)
         if match:
@@ -370,19 +383,136 @@ def _banner_path(kind: str, city: dict[str, Any] | None = None, state: UnifiedSt
     raise FileNotFoundError(f"Не найден локальный баннер системы городов: {path}")
 
 
-def _banner_file_and_embed(
+def _banner_file(
     kind: str,
     *,
     city: dict[str, Any] | None = None,
     state: UnifiedState | None = None,
-) -> tuple[discord.Embed, discord.File]:
+) -> tuple[str, discord.File]:
+    """Подготовить локальный баннер для Components V2 MediaGallery."""
+
     path = _banner_path(kind, city, state)
     suffix = path.suffix.lower() if path.suffix.lower() in IMAGE_EXTENSIONS else ".png"
     filename = f"funfernus_city_{kind}_banner{suffix}"
-    banner_embed = discord.Embed(color=int((state.options if state else {}).get("accent_color", 0x19B9D1)))
-    # В Python-версии discord.py это прямой эквивалент EmbedBuilder#setImage().
-    banner_embed.set_image(url=f"attachment://{filename}")
-    return banner_embed, discord.File(path, filename=filename)
+    return f"attachment://{filename}", discord.File(path, filename=filename)
+
+
+def _clip_component_text(value: str, limit: int) -> str:
+    value = str(value or "").strip()
+    if len(value) <= limit:
+        return value
+    cut = value.rfind("\n", 0, max(1, limit - 1))
+    if cut < limit // 2:
+        cut = value.rfind(" ", 0, max(1, limit - 1))
+    if cut < limit // 2:
+        cut = max(1, limit - 1)
+    return value[:cut].rstrip() + "…"
+
+
+def _embed_card_parts(
+    embed: discord.Embed,
+    *,
+    leading_text: str | None = None,
+) -> tuple[str, str, str, int]:
+    """Преобразовать Embed-данные в текст Components V2 без потери полей."""
+
+    title = str(embed.title or "").strip()
+    sections: list[str] = []
+    if leading_text:
+        sections.append(str(leading_text).strip())
+    if embed.description:
+        sections.append(str(embed.description).strip())
+    for field in embed.fields:
+        name = str(field.name or "").strip()
+        value = str(field.value or "—").strip()
+        sections.append(f"**{name}**\n{value}" if name else value)
+
+    footer = ""
+    if embed.footer and embed.footer.text:
+        footer = str(embed.footer.text).strip()
+
+    # Discord ограничивает суммарный TextDisplay-контент LayoutView 4000
+    # символами. Оставляем запас под markdown заголовка и подписи.
+    body_limit = max(300, 3900 - len(title) - len(footer))
+    body = _clip_component_text("\n\n".join(part for part in sections if part), body_limit)
+    color = embed.color.value if embed.color is not None else 0x19B9D1
+    return title, body, footer, color
+
+
+def _legacy_view_action_rows(
+    source_view: discord.ui.View | None,
+) -> list[discord.ui.ActionRow]:
+    """Перенести кнопки и Select из обычного View внутрь Components V2."""
+
+    if source_view is None:
+        return []
+
+    entries: list[tuple[int, int, discord.ui.Item[Any]]] = []
+    children = list(source_view.children)
+    for index, item in enumerate(children):
+        rendered_row = getattr(item, "_rendered_row", None)
+        explicit_row = getattr(item, "row", None)
+        row = explicit_row if explicit_row is not None else rendered_row
+        entries.append((int(row) if row is not None else index // 5, index, item))
+
+    # Item не может одновременно принадлежать двум View. Сначала корректно
+    # отсоединяем его от legacy View, сохраняя уже привязанный callback.
+    for _, _, item in entries:
+        source_view.remove_item(item)
+
+    grouped: dict[int, list[tuple[int, discord.ui.Item[Any]]]] = {}
+    for row, index, item in entries:
+        grouped.setdefault(row, []).append((index, item))
+
+    result: list[discord.ui.ActionRow] = []
+    for row in sorted(grouped):
+        current = discord.ui.ActionRow()
+        current_weight = 0
+        for _, item in sorted(grouped[row], key=lambda pair: pair[0]):
+            width = int(getattr(item, "width", 1) or 1)
+            if current.children and (width >= 5 or current_weight + width > 5):
+                result.append(current)
+                current = discord.ui.ActionRow()
+                current_weight = 0
+            current.add_item(item)
+            current_weight += width
+            if width >= 5:
+                result.append(current)
+                current = discord.ui.ActionRow()
+                current_weight = 0
+        if current.children:
+            result.append(current)
+    return result
+
+
+class CityCardLayoutView(discord.ui.LayoutView):
+    """Единая широкая карточка: баннер сверху, текст и кнопки в одной рамке."""
+
+    def __init__(
+        self,
+        *,
+        source_view: discord.ui.View | None,
+        container: discord.ui.Container,
+    ) -> None:
+        super().__init__(timeout=source_view.timeout if source_view is not None else None)
+        self.source_view = source_view
+        self.add_item(container)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.source_view is None:
+            return True
+        return await self.source_view.interaction_check(interaction)
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+    ) -> None:
+        if self.source_view is not None:
+            await self.source_view.on_error(interaction, error, item)
+            return
+        await _notify_component_error(interaction, error, context=item.__class__.__name__)
 
 
 def _message_payload(
@@ -391,10 +521,39 @@ def _message_payload(
     *,
     city: dict[str, Any] | None = None,
     state: UnifiedState | None = None,
-) -> tuple[list[discord.Embed], discord.File]:
-    banner_embed, banner_file = _banner_file_and_embed(kind, city=city, state=state)
-    # Два Embed в одном сообщении нужны, чтобы полноразмерный setImage был над заголовком карточки.
-    return [banner_embed, content_embed], banner_file
+    controls: discord.ui.View | None = None,
+    leading_text: str | None = None,
+) -> tuple[discord.ui.LayoutView, discord.File]:
+    """Собрать настоящую полноширинную Components V2-карточку.
+
+    Важное отличие от прежней реализации: баннер больше не находится в
+    отдельном пустом Embed. MediaGallery, заголовок, текст и кнопки помещаются
+    в один Container, поэтому изображение занимает всю ширину карточки точно
+    как на визуальном референсе пользователя.
+    """
+
+    media_url, banner_file = _banner_file(kind, city=city, state=state)
+    title, body, footer, color = _embed_card_parts(content_embed, leading_text=leading_text)
+
+    container = discord.ui.Container(accent_color=color)
+    gallery = discord.ui.MediaGallery()
+    gallery.add_item(media=media_url, description=title or "FunFernus")
+    container.add_item(gallery)
+
+    if title:
+        container.add_item(discord.ui.TextDisplay(f"# {title}"))
+    if body:
+        container.add_item(discord.ui.TextDisplay(body))
+    if footer:
+        container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+
+    rows = _legacy_view_action_rows(controls)
+    if rows:
+        container.add_item(discord.ui.Separator())
+        for row in rows:
+            container.add_item(row)
+
+    return CityCardLayoutView(source_view=controls, container=container), banner_file
 
 
 def _simple_embed(
@@ -418,7 +577,7 @@ async def _send_interaction_card(
     description: str,
     state: UnifiedState | None = None,
     city: dict[str, Any] | None = None,
-    view: discord.ui.View | discord.ui.LayoutView | None = None,
+    view: discord.ui.View | None = None,
     ephemeral: bool = True,
     followup: bool = False,
     color: int | None = None,
@@ -427,38 +586,51 @@ async def _send_interaction_card(
     content = _simple_embed(title, description, color=accent)
 
     def build_send_kwargs() -> dict[str, Any]:
-        embeds, banner_file = _message_payload(kind, content, city=city, state=state)
-        result: dict[str, Any] = {
-            "embeds": embeds,
+        layout, banner_file = _message_payload(
+            kind,
+            content,
+            city=city,
+            state=state,
+            controls=view,
+        )
+        return {
+            "view": layout,
             "file": banner_file,
             "ephemeral": ephemeral,
             "allowed_mentions": discord.AllowedMentions.none(),
         }
-        # discord.py 2.7 не принимает явное view=None в send_message/followup.send.
-        # Параметр необходимо полностью убрать из вызова, когда компонентов нет.
-        if view is not None:
-            result["view"] = view
-        return result
 
     if followup:
-        # После defer(thinking=True) завершаем именно исходный ответ. Иначе
-        # Discord продолжает показывать «бот думает», даже если панель обновлена.
-        embeds, banner_file = _message_payload(kind, content, city=city, state=state)
-        edit_kwargs: dict[str, Any] = {
-            "content": None,
-            "embeds": embeds,
-            "attachments": [banner_file],
-            "allowed_mentions": discord.AllowedMentions.none(),
-        }
-        if view is not None:
-            edit_kwargs["view"] = view
+        # После defer(thinking=True) завершаем исходный ответ, иначе Discord
+        # продолжает показывать бесконечный индикатор «бот думает».
+        layout, banner_file = _message_payload(
+            kind,
+            content,
+            city=city,
+            state=state,
+            controls=view,
+        )
         try:
-            await interaction.edit_original_response(**edit_kwargs)
+            await interaction.edit_original_response(
+                content=None,
+                embeds=[],
+                attachments=[banner_file],
+                view=layout,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            # Файл мог быть закрыт после неудачного edit, поэтому payload
-            # создаётся заново перед резервной отправкой followup-сообщения.
-            await interaction.followup.send(**build_send_kwargs())
+            # Не собираем LayoutView повторно: при первой сборке интерактивные
+            # элементы уже перенесены из legacy View в Container. Повторная
+            # сборка дала бы карточку без кнопок. Открываем только свежий файл
+            # баннера и отправляем тот же готовый LayoutView отдельным ответом.
+            _, fresh_banner_file = _banner_file(kind, city=city, state=state)
+            await interaction.followup.send(
+                view=layout,
+                file=fresh_banner_file,
+                ephemeral=ephemeral,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
 
     send_kwargs = build_send_kwargs()
@@ -512,8 +684,12 @@ async def _send_user_card(
     state: UnifiedState | None = None,
     city: dict[str, Any] | None = None,
 ) -> discord.Message:
-    embeds, file = _message_payload(kind, embed, city=city, state=state)
-    return await user.send(embeds=embeds, file=file, allowed_mentions=discord.AllowedMentions.none())
+    layout, file = _message_payload(kind, embed, city=city, state=state)
+    return await user.send(
+        view=layout,
+        file=file,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 async def _send_channel_card(
@@ -523,19 +699,22 @@ async def _send_channel_card(
     embed: discord.Embed,
     state: UnifiedState,
     city: dict[str, Any] | None = None,
-    view: discord.ui.View | discord.ui.LayoutView | None = None,
+    view: discord.ui.View | None = None,
     content: str | None = None,
 ) -> discord.Message:
-    embeds, file = _message_payload(kind, embed, city=city, state=state)
-    kwargs: dict[str, Any] = {
-        "content": content,
-        "embeds": embeds,
-        "file": file,
-        "allowed_mentions": discord.AllowedMentions.none(),
-    }
-    if view is not None:
-        kwargs["view"] = view
-    return await channel.send(**kwargs)
+    layout, file = _message_payload(
+        kind,
+        embed,
+        city=city,
+        state=state,
+        controls=view,
+        leading_text=content,
+    )
+    return await channel.send(
+        view=layout,
+        file=file,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 async def _edit_message_card(
@@ -545,19 +724,24 @@ async def _edit_message_card(
     embed: discord.Embed,
     state: UnifiedState,
     city: dict[str, Any] | None = None,
-    view: discord.ui.View | discord.ui.LayoutView | None = None,
+    view: discord.ui.View | None = None,
     content: str | None = None,
 ) -> discord.Message:
-    embeds, file = _message_payload(kind, embed, city=city, state=state)
-    kwargs: dict[str, Any] = {
-        "content": content,
-        "embeds": embeds,
-        "attachments": [file],
-        "allowed_mentions": discord.AllowedMentions.none(),
-    }
-    if view is not None:
-        kwargs["view"] = view
-    return await message.edit(**kwargs)
+    layout, file = _message_payload(
+        kind,
+        embed,
+        city=city,
+        state=state,
+        controls=view,
+        leading_text=content,
+    )
+    return await message.edit(
+        content=None,
+        embeds=[],
+        attachments=[file],
+        view=layout,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 def _is_core_admin(user: discord.abc.User, guild: discord.Guild, admin_ids: set[int]) -> bool:
@@ -1380,12 +1564,16 @@ async def create_registry_post(
             return None, None, None, "В форуме обязателен тег, но доступных тегов нет."
         kwargs["applied_tags"] = [available[0]]
 
-    embeds, banner_file = _message_payload("registry", city_registry_embed(city_id, city, state), city=city, state=state)
+    layout, banner_file = _message_payload(
+        "registry",
+        city_registry_embed(city_id, city, state),
+        city=city,
+        state=state,
+    )
     try:
         created = await forum.create_thread(
             name=str(city.get("name", city_id))[:100],
-            content=None,
-            embeds=embeds,
+            view=layout,
             file=banner_file,
             allowed_mentions=discord.AllowedMentions.none(),
             reason=f"Одобрена регистрация города {city_id}",
@@ -2565,21 +2753,19 @@ class CityManagementLauncherView(discord.ui.View):
                 city=city,
             )
             return
-        await _send_interaction_card(
-            interaction,
-            kind="management",
-            title=city_management_embed(city_id, city, state).title or "Управление городом",
-            description=(
-                "Ниже доступны кнопки редактирования. Текущие сведения показаны в дополнительной карточке."
-            ),
-            state=state,
+        layout, file = _message_payload(
+            "management",
+            city_management_embed(city_id, city, state),
             city=city,
-            view=CityManagementView(self.bot, self.store, city_id, interaction.user.id),
+            state=state,
+            controls=CityManagementView(self.bot, self.store, city_id, interaction.user.id),
         )
-        # Ephemeral follow-up с полными полями панели, также с большим локальным баннером.
-        content_embed = city_management_embed(city_id, city, state)
-        embeds, file = _message_payload("management", content_embed, city=city, state=state)
-        await interaction.followup.send(embeds=embeds, file=file, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        await interaction.response.send_message(
+            view=layout,
+            file=file,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 class CityManagementView(discord.ui.View):
@@ -2722,11 +2908,23 @@ class CityManagementView(discord.ui.View):
         if state is None or city is None:
             return
         embed = city_citizens_embed(self.city_id, city, interaction.guild, state, page=0)
-        embeds, file = _message_payload("management", embed, city=city, state=state)
+        layout, file = _message_payload(
+            "management",
+            embed,
+            city=city,
+            state=state,
+            controls=CityCitizenListView(
+                self.bot,
+                self.store,
+                self.city_id,
+                self.mayor_id,
+                page=0,
+                total=len(_citizen_ids(city)),
+            ),
+        )
         await interaction.response.send_message(
-            embeds=embeds,
+            view=layout,
             file=file,
-            view=CityCitizenListView(self.bot, self.store, self.city_id, self.mayor_id, page=0, total=len(_citizen_ids(city))),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -2746,9 +2944,14 @@ class CityManagementView(discord.ui.View):
             state,
             getattr(self.bot, "admin_user_ids", set()),
         )
-        embeds, file = _message_payload("management", city_management_embed(self.city_id, city, state), city=city, state=state)
+        layout, file = _message_payload(
+            "management",
+            city_management_embed(self.city_id, city, state),
+            city=city,
+            state=state,
+        )
         await interaction.response.send_message(
-            embeds=embeds,
+            view=layout,
             file=file,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -2857,7 +3060,7 @@ class CityCitizenListView(discord.ui.View):
             state,
             page=target_page,
         )
-        if interaction.message is None or not interaction.message.embeds:
+        if interaction.message is None:
             await _send_interaction_card(
                 interaction,
                 kind="warning",
@@ -2867,8 +3070,20 @@ class CityCitizenListView(discord.ui.View):
                 city=city,
             )
             return
-        banner_embed = interaction.message.embeds[0]
-        await interaction.response.edit_message(embeds=[banner_embed, content_embed], view=view)
+        layout, file = _message_payload(
+            "management",
+            content_embed,
+            city=city,
+            state=state,
+            controls=view,
+        )
+        await interaction.response.edit_message(
+            content=None,
+            embeds=[],
+            attachments=[file],
+            view=layout,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @discord.ui.button(label="Назад", emoji="⬅️", style=discord.ButtonStyle.secondary)
     async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -3925,7 +4140,7 @@ async def _publish_city_panels_locked(
 
     accent = int(state.options.get("accent_color", 0x19B9D1))
 
-    def panel_payload(kind: str) -> tuple[list[discord.Embed], discord.File, discord.ui.View]:
+    def panel_payload(kind: str) -> tuple[discord.ui.LayoutView, discord.File]:
         accent = int(state.options.get("accent_color", 0x19B9D1))
         if kind == "application":
             title = "🏰 Регистрация города"
@@ -3934,7 +4149,7 @@ async def _publish_city_panels_locked(
                 "а также первые скриншоты построек. После отправки заявка попадёт в закрытый канал администрации."
             )
             footer = "FunFernus • Подача заявок на регистрацию города"
-            source_view = CityApplicationPanelView(bot, store)
+            controls = CityApplicationPanelView(bot, store)
         else:
             title = "⚙️ Управление зарегистрированным городом"
             body = (
@@ -3946,19 +4161,7 @@ async def _publish_city_panels_locked(
                 "• Все изменения и ошибки записываются в отдельный канал логов."
             )
             footer = "FunFernus • Управление городом"
-            source_view = CityManagementLauncherView(bot, store)
-
-        source_button = next(item for item in source_view.children if isinstance(item, discord.ui.Button))
-        button = discord.ui.Button(
-            label=source_button.label,
-            emoji=source_button.emoji,
-            style=source_button.style,
-            custom_id=source_button.custom_id,
-        )
-        button.callback = source_button.callback
-
-        view = discord.ui.View(timeout=None)
-        view.add_item(button)
+            controls = CityManagementLauncherView(bot, store)
 
         content_embed = discord.Embed(
             title=title,
@@ -3967,71 +4170,20 @@ async def _publish_city_panels_locked(
             timestamp=datetime.now(timezone.utc),
         )
         content_embed.set_footer(text=footer)
-        embeds, banner_file = _message_payload(kind, content_embed, state=state)
-        return embeds, banner_file, view
-
-    def is_components_v2_message(message: discord.Message) -> bool:
-        # Discord permanently keeps IS_COMPONENTS_V2 (1 << 15) on a message.
-        # Such a message can no longer be edited with normal content/embeds.
-        # Use the raw flag value so this also works across discord.py 2.6/2.7.
-        return bool(int(message.flags.value) & (1 << 15))
-
-    def is_components_v2_conflict(error: discord.HTTPException) -> bool:
-        error_text = str(error).lower()
-        return (
-            int(getattr(error, "code", 0) or 0) == 50035
-            and (
-                "is_components_v2" in error_text
-                or "components_v2" in error_text
-                or "embeds' field cannot be used" in error_text
-                or 'embeds" field cannot be used' in error_text
-            )
+        return _message_payload(
+            kind,
+            content_embed,
+            state=state,
+            controls=controls,
         )
 
     async def create_panel(channel: discord.TextChannel, kind: str) -> discord.Message:
-        embeds, banner_file, view = panel_payload(kind)
+        layout, banner_file = panel_payload(kind)
         return await channel.send(
-            embeds=embeds,
+            view=layout,
             file=banner_file,
-            view=view,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-
-    async def replace_incompatible_panel(
-        channel: discord.TextChannel,
-        old_message: discord.Message,
-        *,
-        kind: str,
-        reason: str,
-    ) -> discord.Message:
-        # First create the compatible legacy-View + Embed message. This prevents
-        # the public panel from disappearing if Discord rejects the new send.
-        replacement = await create_panel(channel, kind)
-        try:
-            await old_message.delete()
-        except discord.NotFound:
-            pass
-        except discord.Forbidden:
-            log.warning(
-                "Не удалось удалить старую Components V2 панель %s в канале %s; новая панель %s уже создана",
-                old_message.id,
-                channel.id,
-                replacement.id,
-            )
-        except discord.HTTPException:
-            log.exception(
-                "Discord не удалил старую несовместимую панель %s после создания %s",
-                old_message.id,
-                replacement.id,
-            )
-        log.info(
-            "Панель городов пересоздана: kind=%s old=%s new=%s reason=%s",
-            kind,
-            old_message.id,
-            replacement.id,
-            reason,
-        )
-        return replacement
 
     async def upsert(
         channel: discord.TextChannel,
@@ -4048,37 +4200,20 @@ async def _publish_city_panels_locked(
         except discord.NotFound:
             return await create_panel(channel, kind)
 
-        # Messages once published with LayoutView/Components V2 can never be
-        # converted back to Embed messages. Automatically migrate them instead
-        # of repeatedly sending an invalid PATCH request.
-        if is_components_v2_message(message):
-            return await replace_incompatible_panel(
-                channel,
-                message,
-                kind=kind,
-                reason="message flag IS_COMPONENTS_V2",
-            )
-
-        embeds, banner_file, view = panel_payload(kind)
+        layout, banner_file = panel_payload(kind)
         try:
+            # И legacy-сообщение, и уже существующее Components V2-сообщение
+            # обновляются одним корректным запросом. При переходе на LayoutView
+            # Discord требует явно очистить content и embeds.
             return await message.edit(
                 content=None,
-                embeds=embeds,
+                embeds=[],
                 attachments=[banner_file],
-                view=view,
+                view=layout,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-        except discord.HTTPException as exc:
-            # Extra protection for stale Discord cache / messages created by an
-            # older bot build where the flag is only revealed by the API error.
-            if is_components_v2_conflict(exc):
-                return await replace_incompatible_panel(
-                    channel,
-                    message,
-                    kind=kind,
-                    reason=f"Discord API conflict {getattr(exc, 'code', 0)}",
-                )
-            raise
+        except discord.NotFound:
+            return await create_panel(channel, kind)
 
     updated: dict[str, discord.Message] = {}
     try:
@@ -4675,11 +4810,15 @@ async def send_city_setup_message(
         inline=False,
     )
     embed.set_footer(text="FunFernus • Настройка городов")
-    embeds, file = _message_payload("setup", embed, state=state)
+    layout, file = _message_payload(
+        "setup",
+        embed,
+        state=state,
+        controls=CitySetupView(bot, store),
+    )
     kwargs = {
-        "embeds": embeds,
+        "view": layout,
         "file": file,
-        "view": CitySetupView(bot, store),
         "ephemeral": True,
         "allowed_mentions": discord.AllowedMentions.none(),
     }
@@ -5190,11 +5329,16 @@ async def setup_cities(bot: commands.Bot, store: UnifiedDiscordStore, admin_ids:
             "Выберите, кого заменить. После смены старый руководитель сразу потеряет право писать в публикации, "
             "а новый получит его без перезапуска бота."
         )
-        embeds, file = _message_payload("leadership", embed, city=city, state=state)
+        layout, file = _message_payload(
+            "leadership",
+            embed,
+            city=city,
+            state=state,
+            controls=CityLeadershipAdminView(bot, store, normalized_id, interaction.user.id),
+        )
         await interaction.response.send_message(
-            embeds=embeds,
+            view=layout,
             file=file,
-            view=CityLeadershipAdminView(bot, store, normalized_id, interaction.user.id),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
