@@ -5076,6 +5076,8 @@ async def _mark_registry_thread_deleted(
     if found is None:
         return
     city_id, city = found
+    if city.get("deletionInProgress"):
+        return
     if city.get("registryStatus") == "deleted":
         return
     city["registryStatus"] = "deleted"
@@ -5278,6 +5280,246 @@ async def _handle_city_staff_role_change(
         )
 
 
+async def _delete_city_message(
+    channel: discord.abc.Messageable | None,
+    message_id: int,
+    errors: list[str],
+    label: str,
+) -> None:
+    """Best-effort deletion of one bot message without treating missing data as an error."""
+    if channel is None or not message_id:
+        return
+    try:
+        fetch_message = getattr(channel, "fetch_message", None)
+        if fetch_message is None:
+            return
+        message = await fetch_message(message_id)
+        _bot_deleted_messages.add(message.id)
+        await message.delete()
+    except discord.NotFound:
+        return
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        errors.append(f"{label}: {exc}")
+
+
+async def _delete_city_everywhere(
+    interaction: discord.Interaction,
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    city_id: str,
+    admin_ids: set[int],
+) -> tuple[bool, str]:
+    """Delete a test/real city from Discord, local storage and persistent JSON.
+
+    The operation is deliberately idempotent: missing messages, files or a manually
+    removed forum thread do not crash the bot. The city is removed from JSON only
+    after the deletion state has first been persisted.
+    """
+    if interaction.guild is None:
+        return False, "Команда доступна только на Discord-сервере."
+
+    guild = interaction.guild
+    state = store.get(guild.id) or await store.load_or_create(guild)
+    normalized_id = city_id.strip().upper()
+
+    async with _lock(guild.id, normalized_id):
+        city = state.cities.get(normalized_id)
+        if city is None:
+            return False, "Город уже удалён или указан неверный ID."
+        _normalize_city(city)
+        snapshot = copy.deepcopy(city)
+        city["deletionInProgress"] = True
+        city["deletion_in_progress"] = True
+        city["deletionRequestedBy"] = interaction.user.id
+        city["deletion_requested_by"] = interaction.user.id
+        city["deletionRequestedAt"] = _now_iso()
+        city["deletion_requested_at"] = city["deletionRequestedAt"]
+
+        try:
+            await store.save(state)
+        except Exception as exc:
+            state.cities[normalized_id] = snapshot
+            log.exception("Не удалось начать удаление города %s", normalized_id)
+            return False, f"Не удалось сохранить начало удаления: `{exc}`"
+
+        errors: list[str] = []
+
+        review_channel = await _text_channel(bot, int(snapshot.get("review_channel_id", 0) or 0))
+        await _delete_city_message(
+            review_channel,
+            _get_message_id(snapshot, "reviewMessageId", "review_message_id"),
+            errors,
+            "карточка модерации",
+        )
+        await _delete_city_message(
+            review_channel,
+            _get_message_id(snapshot, "reviewScreenshotsMessageId", "review_screenshots_message_id"),
+            errors,
+            "скриншоты модерации",
+        )
+
+        thread_id = _get_message_id(snapshot, "registryThreadId", "registry_thread_id")
+        if thread_id:
+            thread = await _thread_channel(bot, thread_id)
+            if thread is not None:
+                try:
+                    await thread.delete(reason=f"Удаление города {normalized_id} через панель FunFernus")
+                except discord.NotFound:
+                    pass
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    errors.append(f"публикация реестра: {exc}")
+
+        upload_folder = _city_upload_folder(guild.id, normalized_id)
+        try:
+            shutil.rmtree(upload_folder, ignore_errors=False)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(f"локальные файлы: {exc}")
+
+        # Remove from persistent JSON. The counter is intentionally not decreased,
+        # so a deleted ID is never silently reused for another city.
+        state.cities.pop(normalized_id, None)
+        try:
+            await store.save(state)
+        except Exception as exc:
+            snapshot["deletionInProgress"] = False
+            snapshot["deletion_in_progress"] = False
+            snapshot["registryStatus"] = "deleted" if thread_id else snapshot.get("registryStatus", "not_created")
+            snapshot["registry_status"] = snapshot["registryStatus"]
+            state.cities[normalized_id] = snapshot
+            try:
+                await store.save(state)
+            except Exception:
+                log.exception("Не удалось восстановить город %s после ошибки удаления", normalized_id)
+            log.exception("Не удалось завершить удаление города %s", normalized_id)
+            return False, f"Discord-объекты были обработаны, но JSON не удалось обновить: `{exc}`"
+
+    mayor_id = _mayor_id(snapshot)
+    mayor = await _member(guild, mayor_id)
+    if mayor is not None and not _has_active_city(state, mayor_id):
+        role_ids = [int(item) for item in state.roles.get("city_mayor", []) if str(item).isdigit()]
+        roles = [role for role_id in role_ids if (role := guild.get_role(role_id)) is not None]
+        if roles:
+            try:
+                await mayor.remove_roles(*roles, reason=f"Удалён город {normalized_id}")
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                errors.append(f"роль мэра: {exc}")
+
+    mayor_user = await _user(bot, mayor_id)
+    if mayor_user is not None:
+        try:
+            notice = _simple_embed(
+                "🗑️ Город удалён из реестра",
+                (
+                    f"Город **{snapshot.get('name', normalized_id)}** (`{normalized_id}`) удалён администрацией.\n"
+                    "Публикация реестра, карточка заявки и сохранённые материалы больше не используются."
+                ),
+                color=0xD85C5C,
+            )
+            await _send_user_card(mayor_user, kind="warning", embed=notice, state=state, city=snapshot)
+        except discord.HTTPException:
+            errors.append("уведомление мэра: личные сообщения недоступны")
+
+    await _send_city_log(
+        bot,
+        state,
+        title="🗑️ Город полностью удалён",
+        description=(
+            f"Администратор: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+            f"Название: **{snapshot.get('name', normalized_id)}**.\n"
+            f"Мэр: <@{mayor_id}> (`{mayor_id}`).\n"
+            f"Заместитель: <@{_deputy_id(snapshot)}> (`{_deputy_id(snapshot)}`).\n"
+            + (f"Предупреждения: {_trim('; '.join(errors), 1200)}" if errors else "Все связанные данные удалены без дополнительных ошибок.")
+        ),
+        city_id=normalized_id,
+        city=snapshot,
+        color=0xD85C5C,
+    )
+
+    details = (
+        "Город удалён из JSON, публикация и сообщения удалены, локальные изображения очищены. "
+        "Номер города не будет использован повторно."
+    )
+    if errors:
+        details += "\n\nНекоторые необязательные действия не выполнились:\n" + _trim("\n".join(f"• {item}" for item in errors), 1300)
+    return True, details
+
+
+class CityDeleteConfirmView(CityTransientView):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        requester_id: int,
+        admin_ids: set[int],
+    ) -> None:
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.requester_id = requester_id
+        self.admin_ids = admin_ids
+        self.finished = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or interaction.user.id != self.requester_id:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Эта кнопка не для вас",
+                description="Удаление может подтвердить только администратор, который вызвал команду.",
+            )
+            return False
+        if not _is_core_admin(interaction.user, interaction.guild, self.admin_ids):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Доступ потерян",
+                description="У вас больше нет права полностью удалять города.",
+            )
+            return False
+        return not self.finished
+
+    @discord.ui.button(label="Удалить город навсегда", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.finished = True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, details = await _delete_city_everywhere(
+            interaction,
+            self.bot,
+            self.store,
+            self.city_id,
+            self.admin_ids,
+        )
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Город удалён" if ok else "❌ Город не удалён",
+            description=details,
+            state=state,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Отмена", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.finished = True
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        await _send_interaction_card(
+            interaction,
+            kind="notification",
+            title="Удаление отменено",
+            description=f"Город `{self.city_id}` остался без изменений.",
+            state=state,
+            color=0x5865F2,
+        )
+        self.stop()
+
+
 async def setup_cities(bot: commands.Bot, store: UnifiedDiscordStore, admin_ids: set[int]) -> None:
     bot.add_view(CityApplicationPanelView(bot, store))
     bot.add_view(CityReviewView(bot, store))
@@ -5341,6 +5583,53 @@ async def setup_cities(bot: commands.Bot, store: UnifiedDiscordStore, admin_ids:
             file=file,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+    @bot.tree.command(name="удалить_город", description="Полностью удалить тестовый или ненужный город")
+    @app_commands.describe(city_id="ID города, например CITY-0001")
+    @app_commands.guild_only()
+    async def city_delete(interaction: discord.Interaction, city_id: str) -> None:
+        if interaction.guild is None:
+            return
+        state = store.get(interaction.guild.id) or await store.load_or_create(interaction.guild)
+        if not _is_core_admin(interaction.user, interaction.guild, admin_ids):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Полностью удалять города могут только владелец сервера и основные администраторы.",
+                state=state,
+            )
+            return
+        normalized_id = city_id.strip().upper()
+        city = state.cities.get(normalized_id)
+        if city is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Город не найден",
+                description="Укажите существующий ID в формате `CITY-0001`.",
+                state=state,
+            )
+            return
+        _normalize_city(city)
+        await _send_interaction_card(
+            interaction,
+            kind="warning",
+            title=f"🗑️ Удалить {city.get('name', normalized_id)}?",
+            description=(
+                f"Будет полностью удалён город `{normalized_id}`:\n"
+                "• публикация в форуме и её сообщения;\n"
+                "• карточка рассмотрения и скриншоты;\n"
+                "• локальный баннер и изображения;\n"
+                "• запись города и список горожан в JSON.\n\n"
+                "Это действие нельзя отменить. Счётчик ID не откатывается."
+            ),
+            state=state,
+            city=city,
+            view=CityDeleteConfirmView(bot, store, normalized_id, interaction.user.id, admin_ids),
+            color=0xD85C5C,
         )
 
     @bot.listen("on_message")
