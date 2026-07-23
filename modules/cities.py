@@ -3927,7 +3927,7 @@ async def _publish_city_panels_locked(
                 "а также первые скриншоты построек. После отправки заявка попадёт в закрытый канал администрации."
             )
             footer = "FunFernus • Подача заявок на регистрацию города"
-            source_view = CityApplicationLauncherView(bot, store)
+            source_view = CityApplicationPanelView(bot, store)
         else:
             title = "⚙️ Управление зарегистрированным городом"
             body = (
