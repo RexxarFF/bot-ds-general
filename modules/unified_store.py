@@ -51,11 +51,13 @@ class UnifiedState:
         "city_review": 0,
         "city_registry": 0,
         "city_management": 0,
+        "city_logs": 0,
     })
     roles: dict[str, list[int]] = field(default_factory=lambda: {
         "support_staff": [],
         "government_judges": [],
         "city_mayor": [],
+        "city_staff": [],
     })
     messages: dict[str, int] = field(default_factory=lambda: {
         "support_panel": 0,
@@ -86,6 +88,8 @@ class UnifiedState:
         "accent_color": 0x19B9D1,
         "welcome_enabled": True,
         "welcome_delay": 2,
+        "city_allowed_bot_ids": [],
+        "city_application_banner_path": "",
     })
     counters: dict[str, int] = field(default_factory=lambda: {
         "ticket": 0,

@@ -5,9 +5,11 @@ import copy
 import logging
 import re
 import secrets
+import shutil
+import time
 from datetime import datetime, timezone
-from typing import Any
-from urllib.parse import urlparse
+from pathlib import Path
+from typing import Any, Iterable
 
 import discord
 from discord import app_commands
@@ -19,25 +21,39 @@ log = logging.getLogger("funfernus-cities")
 
 CITY_ID_RE = re.compile(r"CITY-\d{4,}")
 DISCORD_ID_RE = re.compile(r"\d{15,22}")
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+MAX_IMAGE_SIZE = 10 * 1024 * 1024
+MAX_SCREENSHOTS = 10
+WARNING_COOLDOWN_SECONDS = 45.0
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+STATIC_BANNER_DIR = PROJECT_ROOT / "assets" / "banners" / "cities"
+CITY_UPLOAD_DIR = PROJECT_ROOT / "assets" / "city_uploads"
+
+STATIC_BANNERS: dict[str, str] = {
+    "application": "city_application.png",
+    "moderation": "city_moderation.png",
+    "registry": "city_registry.png",
+    "management": "city_management.png",
+    "notification": "city_notification.png",
+    "warning": "city_warning.png",
+    "leadership": "city_leadership.png",
+    "logs": "city_logs.png",
+    "setup": "city_setup.png",
+}
+
 _city_locks: dict[tuple[int, str], asyncio.Lock] = {}
+_warning_cooldowns: dict[tuple[int, int], float] = {}
+_bot_deleted_messages: set[int] = set()
+_missing_asset_log_cache: set[tuple[int, str, str]] = set()
 
 
 def _lock(guild_id: int, city_id: str) -> asyncio.Lock:
     return _city_locks.setdefault((guild_id, city_id), asyncio.Lock())
 
 
-def _is_admin(interaction: discord.Interaction, admin_ids: set[int]) -> bool:
-    return bool(
-        interaction.guild
-        and (
-            interaction.guild.owner_id == interaction.user.id
-            or interaction.user.id in admin_ids
-            or (
-                isinstance(interaction.user, discord.Member)
-                and interaction.user.guild_permissions.administrator
-            )
-        )
-    )
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _text(value: Any, fallback: str = "—") -> str:
@@ -70,43 +86,350 @@ def _city_id(message: discord.Message | None) -> str:
     return ""
 
 
-def _discord_id(value: str) -> int | None:
-    match = DISCORD_ID_RE.search(value or "")
-    return int(match.group()) if match else None
-
-
-def _valid_url(value: str) -> bool:
-    try:
-        parsed = urlparse(value.strip())
-    except ValueError:
-        return False
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def _split_urls(value: str, limit: int = 10) -> list[str]:
-    result: list[str] = []
-    for item in re.split(r"[\s]+", value.strip()):
-        clean = item.strip().strip("<>")
-        if clean and len(clean) <= 1000 and _valid_url(clean) and clean not in result:
-            result.append(clean)
-        if len(result) >= limit:
-            break
+def _discord_ids(value: str) -> list[int]:
+    result: list[int] = []
+    for item in DISCORD_ID_RE.findall(value or ""):
+        number = int(item)
+        if number not in result:
+            result.append(number)
     return result
 
 
-def _screenshot_lines(urls: list[str]) -> str:
-    if not urls:
-        return "Скриншоты не приложены."
-    lines: list[str] = []
-    used = 0
-    for index, url in enumerate(urls[:10], 1):
-        line = f"[{index}. Открыть изображение]({url})"
-        extra = len(line) + (1 if lines else 0)
-        if used + extra > 1024:
-            break
-        lines.append(line)
-        used += extra
-    return "\n".join(lines) or "Скриншоты не приложены."
+def _mayor_id(city: dict[str, Any]) -> int:
+    return int(city.get("mayorId", city.get("mayor_id", 0)) or 0)
+
+
+def _deputy_id(city: dict[str, Any]) -> int:
+    return int(city.get("deputyId", city.get("deputy_id", 0)) or 0)
+
+
+def _set_leaders(city: dict[str, Any], mayor_id: int, deputy_id: int) -> None:
+    city["mayorId"] = int(mayor_id)
+    city["deputyId"] = int(deputy_id)
+    # Старые ключи оставлены для безопасного обновления уже созданных данных.
+    city["mayor_id"] = int(mayor_id)
+    city["deputy_id"] = int(deputy_id)
+
+
+def _get_message_id(city: dict[str, Any], camel: str, snake: str) -> int:
+    return int(city.get(camel, city.get(snake, 0)) or 0)
+
+
+def _set_message_id(city: dict[str, Any], camel: str, snake: str, value: int) -> None:
+    city[camel] = int(value)
+    city[snake] = int(value)
+
+
+def _get_paths(city: dict[str, Any], camel: str, snake: str) -> list[str]:
+    raw = city.get(camel, city.get(snake, []))
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw if str(item).strip()]
+
+
+def _set_paths(city: dict[str, Any], camel: str, snake: str, values: Iterable[str]) -> None:
+    clean = [str(item) for item in values if str(item).strip()]
+    city[camel] = clean
+    city[snake] = list(clean)
+
+
+def _project_relative(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        return path.resolve().as_posix()
+
+
+def _resolve_project_path(value: str | Path) -> Path:
+    path = Path(value)
+    candidate = path if path.is_absolute() else PROJECT_ROOT / path
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(PROJECT_ROOT.resolve())
+    except ValueError:
+        # JSON не должен позволять читать или удалять файлы за пределами проекта.
+        return PROJECT_ROOT / ".invalid_city_asset_path"
+    return resolved
+
+
+def _safe_extension(filename: str, content_type: str = "") -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return suffix
+    mapping = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }
+    return mapping.get((content_type or "").lower(), ".png")
+
+
+def _validate_attachment(attachment: discord.Attachment) -> None:
+    name = attachment.filename.lower()
+    content_type = (attachment.content_type or "").lower()
+    suffix = Path(name).suffix.lower()
+    if not content_type.startswith("image/") and suffix not in IMAGE_EXTENSIONS:
+        raise ValueError("поддерживаются только PNG, JPG, JPEG, WEBP и GIF")
+    if attachment.size > MAX_IMAGE_SIZE:
+        raise ValueError("максимальный размер одного изображения — 10 МБ")
+
+
+async def _save_attachment_local(attachment: discord.Attachment, destination: Path) -> str:
+    _validate_attachment(attachment)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    data = await attachment.read()
+    if len(data) > MAX_IMAGE_SIZE:
+        raise ValueError("изображение превышает 10 МБ")
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_bytes(data)
+    temporary.replace(destination)
+    return _project_relative(destination)
+
+
+def _delete_local_paths(paths: Iterable[str]) -> None:
+    for value in paths:
+        try:
+            path = _resolve_project_path(value)
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            log.exception("Не удалось удалить локальный файл города: %s", value)
+
+
+def _city_upload_folder(guild_id: int, city_id: str) -> Path:
+    return CITY_UPLOAD_DIR / str(guild_id) / city_id
+
+
+def _existing_local_paths(values: Iterable[str]) -> list[Path]:
+    result: list[Path] = []
+    for value in values:
+        path = _resolve_project_path(value)
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            result.append(path)
+    return result
+
+
+def _static_banner_path(kind: str) -> Path:
+    return STATIC_BANNER_DIR / STATIC_BANNERS.get(kind, STATIC_BANNERS["notification"])
+
+
+def _city_custom_banner_path(city: dict[str, Any]) -> Path | None:
+    raw = str(city.get("bannerPath", city.get("banner_path", "")) or "").strip()
+    if not raw:
+        return None
+    path = _resolve_project_path(raw)
+    return path if path.is_file() else None
+
+
+def _banner_path(kind: str, city: dict[str, Any] | None = None, state: UnifiedState | None = None) -> Path:
+    if kind == "application" and state is not None:
+        custom = str(state.options.get("city_application_banner_path", "") or "").strip()
+        if custom:
+            path = _resolve_project_path(custom)
+            if path.is_file():
+                return path
+    if city is not None and kind in {"registry", "management"}:
+        custom = _city_custom_banner_path(city)
+        if custom is not None:
+            return custom
+    path = _static_banner_path(kind)
+    if path.is_file():
+        return path
+    fallback = _static_banner_path("notification")
+    if fallback.is_file():
+        return fallback
+    raise FileNotFoundError(f"Не найден локальный баннер системы городов: {path}")
+
+
+def _banner_file_and_embed(
+    kind: str,
+    *,
+    city: dict[str, Any] | None = None,
+    state: UnifiedState | None = None,
+) -> tuple[discord.Embed, discord.File]:
+    path = _banner_path(kind, city, state)
+    suffix = path.suffix.lower() if path.suffix.lower() in IMAGE_EXTENSIONS else ".png"
+    filename = f"funfernus_city_{kind}_banner{suffix}"
+    banner_embed = discord.Embed(color=int((state.options if state else {}).get("accent_color", 0x19B9D1)))
+    # В Python-версии discord.py это прямой эквивалент EmbedBuilder#setImage().
+    banner_embed.set_image(url=f"attachment://{filename}")
+    return banner_embed, discord.File(path, filename=filename)
+
+
+def _message_payload(
+    kind: str,
+    content_embed: discord.Embed,
+    *,
+    city: dict[str, Any] | None = None,
+    state: UnifiedState | None = None,
+) -> tuple[list[discord.Embed], discord.File]:
+    banner_embed, banner_file = _banner_file_and_embed(kind, city=city, state=state)
+    # Два Embed в одном сообщении нужны, чтобы полноразмерный setImage был над заголовком карточки.
+    return [banner_embed, content_embed], banner_file
+
+
+def _simple_embed(
+    title: str,
+    description: str,
+    *,
+    color: int = 0x19B9D1,
+    footer: str = "FunFernus • Система городов",
+) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.now(timezone.utc))
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
+
+
+async def _send_interaction_card(
+    interaction: discord.Interaction,
+    *,
+    kind: str,
+    title: str,
+    description: str,
+    state: UnifiedState | None = None,
+    city: dict[str, Any] | None = None,
+    view: discord.ui.View | None = None,
+    ephemeral: bool = True,
+    followup: bool = False,
+    color: int | None = None,
+) -> None:
+    accent = color if color is not None else int((state.options if state else {}).get("accent_color", 0x19B9D1))
+    content = _simple_embed(title, description, color=accent)
+    embeds, file = _message_payload(kind, content, city=city, state=state)
+    kwargs = {
+        "embeds": embeds,
+        "file": file,
+        "view": view,
+        "ephemeral": ephemeral,
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    if followup:
+        await interaction.followup.send(**kwargs)
+    else:
+        await interaction.response.send_message(**kwargs)
+
+
+async def _send_user_card(
+    user: discord.abc.Messageable,
+    *,
+    kind: str,
+    embed: discord.Embed,
+    state: UnifiedState | None = None,
+    city: dict[str, Any] | None = None,
+) -> discord.Message:
+    embeds, file = _message_payload(kind, embed, city=city, state=state)
+    return await user.send(embeds=embeds, file=file, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def _send_channel_card(
+    channel: discord.abc.Messageable,
+    *,
+    kind: str,
+    embed: discord.Embed,
+    state: UnifiedState,
+    city: dict[str, Any] | None = None,
+    view: discord.ui.View | None = None,
+    content: str | None = None,
+) -> discord.Message:
+    embeds, file = _message_payload(kind, embed, city=city, state=state)
+    return await channel.send(
+        content=content,
+        embeds=embeds,
+        file=file,
+        view=view,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _edit_message_card(
+    message: discord.Message,
+    *,
+    kind: str,
+    embed: discord.Embed,
+    state: UnifiedState,
+    city: dict[str, Any] | None = None,
+    view: discord.ui.View | None = None,
+    content: str | None = None,
+) -> discord.Message:
+    embeds, file = _message_payload(kind, embed, city=city, state=state)
+    return await message.edit(
+        content=content,
+        embeds=embeds,
+        attachments=[file],
+        view=view,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+def _is_core_admin(user: discord.abc.User, guild: discord.Guild, admin_ids: set[int]) -> bool:
+    if guild.owner_id == user.id or user.id in admin_ids:
+        return True
+    return isinstance(user, discord.Member) and user.guild_permissions.administrator
+
+
+def _is_city_staff_member(
+    user: discord.abc.User,
+    guild: discord.Guild,
+    state: UnifiedState,
+    admin_ids: set[int],
+) -> bool:
+    if _is_core_admin(user, guild, admin_ids):
+        return True
+    if not isinstance(user, discord.Member):
+        return False
+    staff_roles = set(int(item) for item in state.roles.get("city_staff", []) if str(item).isdigit())
+    return bool(staff_roles.intersection(role.id for role in user.roles))
+
+
+def _allowed_bot_ids(state: UnifiedState) -> set[int]:
+    raw = state.options.get("city_allowed_bot_ids", [])
+    if not isinstance(raw, list):
+        return set()
+    return {int(item) for item in raw if str(item).isdigit()}
+
+
+def _refresh_allowed_writers(
+    guild: discord.Guild,
+    state: UnifiedState,
+    city: dict[str, Any],
+    admin_ids: set[int],
+    bot_user_id: int = 0,
+) -> list[int]:
+    allowed = {_mayor_id(city), _deputy_id(city), guild.owner_id, *admin_ids, *_allowed_bot_ids(state)}
+    if bot_user_id:
+        allowed.add(bot_user_id)
+    staff_roles = set(int(item) for item in state.roles.get("city_staff", []) if str(item).isdigit())
+    for member in guild.members:
+        if member.guild_permissions.administrator or staff_roles.intersection(role.id for role in member.roles):
+            allowed.add(member.id)
+    result = sorted(item for item in allowed if item > 0)
+    city["allowedWriterIds"] = result
+    city["allowed_writer_ids"] = list(result)
+    city["allowedRoleIds"] = sorted(staff_roles)
+    city["allowed_role_ids"] = sorted(staff_roles)
+    return result
+
+
+def _can_write_city_thread(
+    message: discord.Message,
+    guild: discord.Guild,
+    state: UnifiedState,
+    city: dict[str, Any],
+    admin_ids: set[int],
+    bot_user_id: int,
+) -> bool:
+    if message.author.id == bot_user_id:
+        return True
+    if message.author.bot:
+        return message.author.id in _allowed_bot_ids(state)
+    if message.author.id in {_mayor_id(city), _deputy_id(city)}:
+        return True
+    # allowedWriterIds хранится в JSON как снимок разрешённых ID для аудита и восстановления,
+    # но не используется как самостоятельный источник прав. Иначе пользователь, у которого
+    # сняли роль модератора, мог бы оставаться разрешённым до следующей синхронизации.
+    return _is_city_staff_member(message.author, guild, state, admin_ids)
 
 
 def _status_text(status: str) -> str:
@@ -125,9 +448,37 @@ def _status_color(status: str, accent: int) -> int:
     }.get(status, accent)
 
 
+def _leader_text(city: dict[str, Any], leader: str) -> str:
+    user_id = _mayor_id(city) if leader == "mayor" else _deputy_id(city)
+    present = bool(city.get(f"{leader}Present", city.get(f"{leader}_present", True)))
+    if not user_id:
+        return "Не назначен"
+    return f"<@{user_id}>\n`ID: {user_id}`" + ("" if present else "\n⚠️ Покинул сервер")
+
+
+def _registry_status(city: dict[str, Any]) -> str:
+    status = str(city.get("registryStatus", city.get("registry_status", "not_created")) or "not_created")
+    return {
+        "active": "✅ Публикация доступна",
+        "deleted": "❌ Публикация удалена",
+        "message_deleted": "⚠️ Основная карточка удалена",
+        "screenshots_deleted": "⚠️ Сообщение со скриншотами удалено",
+        "not_created": "Не создана",
+        "unavailable": "⚠️ Публикация недоступна",
+    }.get(status, status)
+
+
 def _find_city_for_mayor(state: UnifiedState, mayor_id: int) -> tuple[str, dict[str, Any]] | None:
     for city_id, city in state.cities.items():
-        if city.get("status") == "approved" and int(city.get("mayor_id", 0)) == mayor_id:
+        _normalize_city(city)
+        if city.get("status") == "approved" and _mayor_id(city) == mayor_id:
+            return city_id, city
+    return None
+
+
+def _find_city_by_thread(state: UnifiedState, thread_id: int) -> tuple[str, dict[str, Any]] | None:
+    for city_id, city in state.cities.items():
+        if _get_message_id(city, "registryThreadId", "registry_thread_id") == thread_id:
             return city_id, city
     return None
 
@@ -136,9 +487,7 @@ def _has_active_city(state: UnifiedState, mayor_id: int, *, exclude: str = "") -
     for city_id, city in state.cities.items():
         if city_id == exclude:
             continue
-        if int(city.get("mayor_id", 0)) != mayor_id:
-            continue
-        if city.get("status") in {"pending", "approved"}:
+        if _mayor_id(city) == mayor_id and city.get("status") in {"pending", "approved"}:
             return True
     return False
 
@@ -151,6 +500,37 @@ def _name_taken(state: UnifiedState, name: str, *, exclude: str = "") -> bool:
         if str(city.get("name", "")).casefold().strip() == normalized:
             return True
     return False
+
+
+def _normalize_city(city: dict[str, Any]) -> None:
+    _set_leaders(city, _mayor_id(city), _deputy_id(city))
+    for camel, snake in (
+        ("reviewMessageId", "review_message_id"),
+        ("reviewScreenshotsMessageId", "review_screenshots_message_id"),
+        ("registryThreadId", "registry_thread_id"),
+        ("registryMessageId", "registry_message_id"),
+        ("registryScreenshotsMessageId", "registry_screenshots_message_id"),
+    ):
+        _set_message_id(city, camel, snake, _get_message_id(city, camel, snake))
+    _set_paths(city, "screenshotPaths", "screenshot_paths", _get_paths(city, "screenshotPaths", "screenshot_paths"))
+    banner = str(city.get("bannerPath", city.get("banner_path", "")) or "")
+    city["bannerPath"] = banner
+    city["banner_path"] = banner
+    city.setdefault("allowedWriterIds", list(city.get("allowed_writer_ids", [])))
+    city.setdefault("allowed_writer_ids", list(city.get("allowedWriterIds", [])))
+    city.setdefault("allowedRoleIds", list(city.get("allowed_role_ids", [])))
+    city.setdefault("allowed_role_ids", list(city.get("allowedRoleIds", [])))
+    city.setdefault("mayorPresent", bool(city.get("mayor_present", True)))
+    city.setdefault("deputyPresent", bool(city.get("deputy_present", True)))
+    city["mayor_present"] = bool(city["mayorPresent"])
+    city["deputy_present"] = bool(city["deputyPresent"])
+    city.setdefault("registryStatus", str(city.get("registry_status", "not_created")))
+    city["registry_status"] = str(city["registryStatus"])
+    city.setdefault("question_history", [])
+    city.setdefault("active_question", {})
+    # Устаревшие URL намеренно не используются для отображения изображений.
+    city["screenshots"] = []
+    city["banner_url"] = ""
 
 
 async def _text_channel(bot: commands.Bot, channel_id: int) -> discord.TextChannel | None:
@@ -193,6 +573,8 @@ async def _thread_channel(bot: commands.Bot, channel_id: int) -> discord.Thread 
 
 
 async def _member(guild: discord.Guild, user_id: int) -> discord.Member | None:
+    if not user_id:
+        return None
     member = guild.get_member(user_id)
     if member is not None:
         return member
@@ -203,6 +585,8 @@ async def _member(guild: discord.Guild, user_id: int) -> discord.Member | None:
 
 
 async def _user(bot: commands.Bot, user_id: int) -> discord.User | None:
+    if not user_id:
+        return None
     user = bot.get_user(user_id)
     if user is not None:
         return user
@@ -212,18 +596,57 @@ async def _user(bot: commands.Bot, user_id: int) -> discord.User | None:
         return None
 
 
-async def _delete_asset_message(store: UnifiedDiscordStore, guild: discord.Guild, message_id: int) -> None:
-    if not message_id:
-        return
+async def _send_city_log(
+    bot: commands.Bot,
+    state: UnifiedState,
+    *,
+    title: str,
+    description: str,
+    city_id: str = "",
+    city: dict[str, Any] | None = None,
+    color: int = 0x5865F2,
+) -> None:
+    channel = await _text_channel(bot, int(state.channels.get("city_logs", 0)))
+    footer = "FunFernus • Логи городов" + (f" • {city_id}" if city_id else "")
+    embed = _simple_embed(title, description, color=color, footer=footer)
+    if city_id:
+        embed.add_field(name="ID города", value=f"`{city_id}`", inline=True)
     try:
-        channel = await store.config_channel(guild)
-        message = await channel.fetch_message(message_id)
-        await message.delete()
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        pass
+        if channel is None:
+            log.warning("Канал логов городов недоступен: %s — %s", title, description)
+            return
+        await _send_channel_card(channel, kind="logs", embed=embed, state=state, city=city)
+    except Exception:
+        log.exception("Не удалось отправить лог системы городов: %s", title)
+
+
+async def _log_missing_local_asset_once(
+    bot: commands.Bot,
+    state: UnifiedState,
+    city_id: str,
+    city: dict[str, Any],
+    asset_type: str,
+) -> None:
+    key = (state.guild_id, city_id, asset_type)
+    if key in _missing_asset_log_cache:
+        return
+    _missing_asset_log_cache.add(key)
+    await _send_city_log(
+        bot,
+        state,
+        title="⚠️ Локальный файл города отсутствует",
+        description=(
+            f"Не найден локальный файл типа **{asset_type}** для города **{city.get('name', city_id)}**. "
+            "Бот продолжил работу и использовал безопасный резервный визуал либо пропустил вложение."
+        ),
+        city_id=city_id,
+        city=city,
+        color=0xF2B84B,
+    )
 
 
 def city_review_embed(city_id: str, city: dict[str, Any], state: UnifiedState) -> discord.Embed:
+    _normalize_city(city)
     status = str(city.get("status", "pending"))
     accent = int(state.options.get("accent_color", 0x19B9D1))
     embed = discord.Embed(
@@ -232,80 +655,400 @@ def city_review_embed(city_id: str, city: dict[str, Any], state: UnifiedState) -
         color=_status_color(status, accent),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Название", value=_trim(city.get("name"), 1024), inline=True)
-    embed.add_field(name="Мэр", value=f"<@{int(city.get('mayor_id', 0))}>", inline=True)
-    embed.add_field(name="Заместитель", value=f"<@{int(city.get('deputy_id', 0))}>", inline=True)
+    embed.add_field(name="Название", value=_trim(city.get("name")), inline=True)
+    embed.add_field(name="Мэр", value=_leader_text(city, "mayor"), inline=True)
+    embed.add_field(name="Заместитель", value=_leader_text(city, "deputy"), inline=True)
     embed.add_field(name="Архитектурный стиль", value=_trim(city.get("style")), inline=False)
     embed.add_field(name="Координаты • Верхний мир", value=_trim(city.get("overworld_coords")), inline=True)
     embed.add_field(name="Координаты • Нижний мир", value=_trim(city.get("nether_coords")), inline=True)
     embed.add_field(name="Описание города", value=_trim(city.get("description")), inline=False)
-    embed.add_field(name="Скриншоты первых построек", value=_screenshot_lines(list(city.get("screenshots", []))), inline=False)
-    embed.add_field(name="Заявку отправил", value=f"<@{int(city.get('applicant_id', 0))}>", inline=False)
+    paths = _get_paths(city, "screenshotPaths", "screenshot_paths")
+    embed.add_field(
+        name="Скриншоты первых построек",
+        value=f"📎 Отправлены отдельным сообщением: **{len(paths)} шт.**" if paths else "Не приложены.",
+        inline=False,
+    )
+    embed.add_field(name="Заявку отправил", value=f"<@{int(city.get('applicant_id', 0))}>\n`ID: {int(city.get('applicant_id', 0))}`", inline=False)
 
     history = city.get("question_history", [])
     if history:
         latest = history[-1]
-        question = _trim(latest.get("question"), 500)
-        answer = _trim(latest.get("answer"), 500, "Ответ ещё не получен.")
-        embed.add_field(name="Последний вопрос администрации", value=question, inline=False)
-        embed.add_field(name="Ответ мэра", value=answer, inline=False)
+        embed.add_field(name="Последний вопрос администрации", value=_trim(latest.get("question"), 700), inline=False)
+        embed.add_field(name="Ответ мэра", value=_trim(latest.get("answer"), 700, "Ответ ещё не получен."), inline=False)
 
     if status == "approved":
         embed.add_field(name="Одобрил", value=f"<@{int(city.get('reviewer_id', 0))}>", inline=True)
-        if city.get("registry_thread_id"):
-            embed.add_field(name="Карточка реестра", value=f"<#{int(city['registry_thread_id'])}>", inline=True)
+        thread_id = _get_message_id(city, "registryThreadId", "registry_thread_id")
+        if thread_id:
+            embed.add_field(name="Публикация реестра", value=f"<#{thread_id}>\n{_registry_status(city)}", inline=True)
     elif status == "rejected":
         embed.add_field(name="Причина отказа", value=_trim(city.get("rejection_reason")), inline=False)
         embed.add_field(name="Отклонил", value=f"<@{int(city.get('reviewer_id', 0))}>", inline=True)
 
-    screenshots = list(city.get("screenshots", []))
-    if screenshots:
-        embed.set_image(url=screenshots[0])
     embed.set_footer(text=f"FunFernus • {city_id} • {_status_text(status)}")
     return embed
 
 
 def city_registry_embed(city_id: str, city: dict[str, Any], state: UnifiedState) -> discord.Embed:
+    _normalize_city(city)
     accent = int(state.options.get("accent_color", 0x19B9D1))
     embed = discord.Embed(
         title=f"🏰 {_trim(city.get('name'), 200)}",
         description=_trim(city.get("description"), 4096),
         color=accent,
+        timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Мэр", value=f"<@{int(city.get('mayor_id', 0))}>", inline=True)
-    embed.add_field(name="Заместитель мэра", value=f"<@{int(city.get('deputy_id', 0))}>", inline=True)
+    embed.add_field(name="Мэр", value=_leader_text(city, "mayor"), inline=True)
+    embed.add_field(name="Заместитель мэра", value=_leader_text(city, "deputy"), inline=True)
     embed.add_field(name="Архитектурный стиль", value=_trim(city.get("style")), inline=False)
     embed.add_field(name="Верхний мир", value=_trim(city.get("overworld_coords")), inline=True)
     embed.add_field(name="Нижний мир и метро", value=_trim(city.get("nether_coords")), inline=True)
-    embed.add_field(name="Скриншоты города", value=_screenshot_lines(list(city.get("screenshots", []))), inline=False)
-    banner_url = str(city.get("banner_url", "")).strip()
-    if banner_url:
-        embed.set_image(url=banner_url)
+    paths = _get_paths(city, "screenshotPaths", "screenshot_paths")
+    embed.add_field(
+        name="Скриншоты города",
+        value=f"📎 Находятся в следующем сообщении: **{len(paths)} шт.**" if paths else "Не приложены.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Кто может писать в этой публикации",
+        value="Мэр, заместитель мэра, настроенная администрация и разрешённые боты. Остальные сообщения удаляются автоматически.",
+        inline=False,
+    )
     embed.set_footer(text=f"Официальный реестр FunFernus • ID города: {city_id}")
     return embed
 
 
 def city_management_embed(city_id: str, city: dict[str, Any], state: UnifiedState) -> discord.Embed:
+    _normalize_city(city)
     accent = int(state.options.get("accent_color", 0x19B9D1))
     embed = discord.Embed(
         title=f"⚙️ Управление городом • {_trim(city.get('name'), 180)}",
         description=(
-            "Изменения применяются к базе и сразу синхронизируются с карточкой "
-            "в публичном реестре городов."
+            "Изменения сохраняются по Discord ID и сразу синхронизируются с официальной публикацией. "
+            "Смена мэра и заместителя доступна только администрации через отдельную панель."
         ),
         color=accent,
+        timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="ID города", value=f"`{city_id}`", inline=True)
-    embed.add_field(name="Мэр", value=f"<@{int(city.get('mayor_id', 0))}>", inline=True)
-    embed.add_field(name="Заместитель", value=f"<@{int(city.get('deputy_id', 0))}>", inline=True)
+    embed.add_field(name="Мэр", value=_leader_text(city, "mayor"), inline=True)
+    embed.add_field(name="Заместитель", value=_leader_text(city, "deputy"), inline=True)
     embed.add_field(name="Стиль", value=_trim(city.get("style"), 500), inline=False)
     embed.add_field(name="Верхний мир", value=_trim(city.get("overworld_coords"), 500), inline=True)
     embed.add_field(name="Нижний мир", value=_trim(city.get("nether_coords"), 500), inline=True)
-    embed.add_field(name="Главный баннер", value="Установлен" if city.get("banner_url") else "Не установлен", inline=False)
-    if city.get("banner_url"):
-        embed.set_image(url=str(city["banner_url"]))
+    embed.add_field(name="Главный баннер", value="Установлен локальным файлом" if city.get("bannerPath") else "Используется системный баннер", inline=False)
+    embed.add_field(name="Публикация реестра", value=_registry_status(city), inline=False)
     embed.set_footer(text="FunFernus • Панель мэра")
     return embed
+
+
+def _local_screenshot_files(city: dict[str, Any]) -> list[discord.File]:
+    paths = _existing_local_paths(_get_paths(city, "screenshotPaths", "screenshot_paths"))[:MAX_SCREENSHOTS]
+    files: list[discord.File] = []
+    for index, path in enumerate(paths, 1):
+        suffix = path.suffix.lower() if path.suffix.lower() in IMAGE_EXTENSIONS else ".png"
+        files.append(discord.File(path, filename=f"city_screenshot_{index:02d}{suffix}"))
+    return files
+
+
+async def _send_screenshot_message(
+    channel: discord.abc.Messageable,
+    city_id: str,
+    city: dict[str, Any],
+    *,
+    context: str,
+) -> discord.Message | None:
+    files = _local_screenshot_files(city)
+    if not files:
+        return None
+    return await channel.send(
+        content=f"📸 **Скриншоты города `{city_id}` • {context}**",
+        files=files,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _edit_screenshot_message(
+    channel: discord.abc.Messageable,
+    message_id: int,
+    city_id: str,
+    city: dict[str, Any],
+    *,
+    context: str,
+) -> tuple[discord.Message | None, str]:
+    files = _local_screenshot_files(city)
+    if not files:
+        if message_id and hasattr(channel, "fetch_message"):
+            try:
+                old = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+                _bot_deleted_messages.add(old.id)
+                await old.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        return None, "Скриншотов нет."
+    if message_id and hasattr(channel, "fetch_message"):
+        try:
+            message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+            edited = await message.edit(
+                content=f"📸 **Скриншоты города `{city_id}` • {context}**",
+                attachments=files,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return edited, "Сообщение со скриншотами обновлено."
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            return None, "Боту не хватает прав для обновления скриншотов."
+        except discord.HTTPException as exc:
+            return None, f"Discord не обновил скриншоты: {exc}"
+    try:
+        message = await channel.send(
+            content=f"📸 **Скриншоты города `{city_id}` • {context}**",
+            files=files,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return message, "Сообщение со скриншотами создано заново."
+    except discord.HTTPException as exc:
+        return None, f"Discord не отправил скриншоты: {exc}"
+
+
+async def _migrate_legacy_city_assets(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    guild: discord.Guild,
+    state: UnifiedState,
+) -> bool:
+    """Переносит старые Discord-вложения в локальную папку без использования URL в карточках."""
+    changed = False
+    try:
+        config_channel = await store.config_channel(guild)
+    except Exception:
+        config_channel = None
+
+    for city_id, city in state.cities.items():
+        _normalize_city(city)
+        folder = _city_upload_folder(guild.id, city_id)
+        if not _get_paths(city, "screenshotPaths", "screenshot_paths") and config_channel is not None:
+            raw_assets = city.get("screenshot_assets", [])
+            local_paths: list[str] = []
+            if isinstance(raw_assets, list):
+                for index, raw in enumerate(raw_assets[:MAX_SCREENSHOTS], 1):
+                    asset = AssetRef.from_dict(raw)
+                    if not asset.message_id:
+                        continue
+                    try:
+                        message = await config_channel.fetch_message(asset.message_id)
+                        attachment = next(
+                            (item for item in message.attachments if item.filename == asset.filename),
+                            message.attachments[0] if message.attachments else None,
+                        )
+                        if attachment is None:
+                            continue
+                        suffix = _safe_extension(attachment.filename, attachment.content_type or "")
+                        destination = folder / "screenshots" / f"screenshot_{index:02d}{suffix}"
+                        local_paths.append(await _save_attachment_local(attachment, destination))
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, OSError):
+                        log.exception("Не удалось перенести старый скриншот города %s", city_id)
+            if local_paths:
+                _set_paths(city, "screenshotPaths", "screenshot_paths", local_paths)
+                changed = True
+
+        if not city.get("bannerPath") and config_channel is not None:
+            asset = AssetRef.from_dict(city.get("banner_asset", {}))
+            if asset.message_id:
+                try:
+                    message = await config_channel.fetch_message(asset.message_id)
+                    attachment = next(
+                        (item for item in message.attachments if item.filename == asset.filename),
+                        message.attachments[0] if message.attachments else None,
+                    )
+                    if attachment is not None:
+                        suffix = _safe_extension(attachment.filename, attachment.content_type or "")
+                        destination = folder / f"main_banner{suffix}"
+                        relative = await _save_attachment_local(attachment, destination)
+                        city["bannerPath"] = relative
+                        city["banner_path"] = relative
+                        changed = True
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, OSError):
+                    log.exception("Не удалось перенести старый баннер города %s", city_id)
+
+        # Старые внешние ссылки больше никогда не выводятся.
+        if city.get("screenshots") or city.get("banner_url"):
+            city["screenshots"] = []
+            city["banner_url"] = ""
+            changed = True
+
+    panel_asset = state.asset("city_application_panel")
+    if not state.options.get("city_application_banner_path") and panel_asset.message_id and config_channel is not None:
+        try:
+            message = await config_channel.fetch_message(panel_asset.message_id)
+            attachment = next(
+                (item for item in message.attachments if item.filename == panel_asset.filename),
+                message.attachments[0] if message.attachments else None,
+            )
+            if attachment is not None:
+                suffix = _safe_extension(attachment.filename, attachment.content_type or "")
+                destination = STATIC_BANNER_DIR / f"custom_application{suffix}"
+                state.options["city_application_banner_path"] = await _save_attachment_local(attachment, destination)
+                changed = True
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, OSError):
+            log.exception("Не удалось перенести старый баннер панели городов")
+
+    if changed:
+        await store.save(state)
+    return changed
+
+
+async def _audit_city_state(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    guild: discord.Guild,
+    state: UnifiedState,
+    admin_ids: set[int],
+) -> None:
+    changed = False
+    notices: list[tuple[str, str, str, dict[str, Any], int]] = []
+
+    for city_id, city in state.cities.items():
+        _normalize_city(city)
+
+        mayor = await _member(guild, _mayor_id(city))
+        deputy = await _member(guild, _deputy_id(city))
+        presence_checks = (
+            ("mayor", mayor is not None, "мэр"),
+            ("deputy", deputy is not None, "заместитель мэра"),
+        )
+        for role_key, present, role_label in presence_checks:
+            previous_present = bool(city.get(f"{role_key}Present", city.get(f"{role_key}_present", True)))
+            if previous_present == present:
+                continue
+            city[f"{role_key}Present"] = present
+            city[f"{role_key}_present"] = present
+            stamp_key = f"{role_key}{'JoinedAt' if present else 'LeftAt'}"
+            city[stamp_key] = _now_iso()
+            city[f"{role_key}_{'joined_at' if present else 'left_at'}"] = city[stamp_key]
+            changed = True
+            leader_id = _mayor_id(city) if role_key == "mayor" else _deputy_id(city)
+            notices.append(
+                (
+                    "👤 Руководитель снова найден на сервере" if present else "⚠️ Руководитель отсутствует на сервере",
+                    (
+                        f"Discord ID `{leader_id}` ({role_label}) города **{city.get('name', city_id)}** "
+                        + (
+                            "снова принадлежит участнику сервера. Доступ по ID восстановлен автоматически."
+                            if present
+                            else "не найден среди участников. Система продолжает работать, но администрации необходимо назначить нового руководителя."
+                        )
+                    ),
+                    city_id,
+                    city,
+                    0x59B77A if present else 0xF2B84B,
+                )
+            )
+
+        before = list(city.get("allowedWriterIds", []))
+        _refresh_allowed_writers(guild, state, city, admin_ids, bot.user.id if bot.user else 0)
+        if before != city.get("allowedWriterIds", []):
+            changed = True
+
+        if city.get("status") == "approved":
+            thread_id = _get_message_id(city, "registryThreadId", "registry_thread_id")
+            previous_status = str(city.get("registryStatus", city.get("registry_status", "not_created")))
+            new_status = previous_status
+            if not thread_id:
+                new_status = "not_created"
+            else:
+                thread = await _thread_channel(bot, thread_id)
+                if thread is None:
+                    new_status = "deleted"
+                else:
+                    registry_message_id = _get_message_id(city, "registryMessageId", "registry_message_id")
+                    if registry_message_id:
+                        try:
+                            await thread.fetch_message(registry_message_id)
+                        except discord.NotFound:
+                            new_status = "message_deleted"
+                        except (discord.Forbidden, discord.HTTPException):
+                            new_status = "unavailable"
+                        else:
+                            screenshot_message_id = _get_message_id(
+                                city,
+                                "registryScreenshotsMessageId",
+                                "registry_screenshots_message_id",
+                            )
+                            if screenshot_message_id:
+                                try:
+                                    await thread.fetch_message(screenshot_message_id)
+                                except discord.NotFound:
+                                    new_status = "screenshots_deleted"
+                                except (discord.Forbidden, discord.HTTPException):
+                                    new_status = "unavailable"
+                                else:
+                                    new_status = "active"
+                            else:
+                                new_status = "active"
+                    else:
+                        new_status = "message_deleted"
+
+            if previous_status != new_status:
+                city["registryStatus"] = new_status
+                city["registry_status"] = new_status
+                changed = True
+                if new_status in {"deleted", "message_deleted", "screenshots_deleted", "not_created", "unavailable"}:
+                    city["registryDeletedAt"] = _now_iso()
+                    city["registry_deleted_at"] = city["registryDeletedAt"]
+                    notices.append(
+                        (
+                            "🗑️ Нарушена связь с публикацией города",
+                            (
+                                f"Проверка после запуска обнаружила проблему у города **{city.get('name', city_id)}**. "
+                                f"Статус публикации: **{_registry_status(city)}**. "
+                                "Панель управления продолжит работать и покажет этот статус без падения бота."
+                            ),
+                            city_id,
+                            city,
+                            0xD85C5C,
+                        )
+                    )
+                elif new_status == "active":
+                    notices.append(
+                        (
+                            "✅ Связь с публикацией города восстановлена",
+                            f"Публикация города **{city.get('name', city_id)}** снова доступна и связана с JSON-данными.",
+                            city_id,
+                            city,
+                            0x59B77A,
+                        )
+                    )
+
+        for local_path in _get_paths(city, "screenshotPaths", "screenshot_paths"):
+            if not _resolve_project_path(local_path).is_file():
+                await _log_missing_local_asset_once(bot, state, city_id, city, "скриншот")
+                break
+        banner_raw = str(city.get("bannerPath", "") or "")
+        if banner_raw and not _resolve_project_path(banner_raw).is_file():
+            if city.get("bannerFileStatus") != "missing":
+                changed = True
+            city["bannerFileStatus"] = "missing"
+            await _log_missing_local_asset_once(bot, state, city_id, city, "главный баннер")
+        elif banner_raw:
+            if city.get("bannerFileStatus") != "active":
+                changed = True
+            city["bannerFileStatus"] = "active"
+
+    if changed:
+        await store.save(state)
+
+    for title, description, city_id, city, color in notices:
+        await _send_city_log(
+            bot,
+            state,
+            title=title,
+            description=description,
+            city_id=city_id,
+            city=city,
+            color=color,
+        )
 
 
 async def _edit_review_message(
@@ -317,11 +1060,25 @@ async def _edit_review_message(
     channel = await _text_channel(bot, int(city.get("review_channel_id", 0)))
     if channel is None:
         return
+    message_id = _get_message_id(city, "reviewMessageId", "review_message_id")
+    if not message_id:
+        return
     try:
-        message = await channel.fetch_message(int(city.get("review_message_id", 0)))
+        message = await channel.fetch_message(message_id)
         view = CityReviewView(bot, bot.unified_store, city_id) if city.get("status") == "pending" else None  # type: ignore[attr-defined]
-        await message.edit(embed=city_review_embed(city_id, city, state), view=view)
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        await _edit_message_card(
+            message,
+            kind="moderation",
+            embed=city_review_embed(city_id, city, state),
+            state=state,
+            city=city,
+            view=view,
+        )
+    except discord.NotFound:
+        city["reviewMessageStatus"] = "deleted"
+        city["review_message_status"] = "deleted"
+        log.warning("Модерационная карточка города %s удалена", city_id)
+    except (discord.Forbidden, discord.HTTPException):
         log.exception("Не удалось обновить модерационную карточку города %s", city_id)
 
 
@@ -333,25 +1090,58 @@ async def sync_registry_post(
     *,
     rename_thread: bool = False,
 ) -> tuple[bool, str]:
-    thread = await _thread_channel(bot, int(city.get("registry_thread_id", 0)))
+    thread_id = _get_message_id(city, "registryThreadId", "registry_thread_id")
+    thread = await _thread_channel(bot, thread_id)
     if thread is None:
-        return False, "Связанная тема реестра не найдена."
+        city["registryStatus"] = "deleted"
+        city["registry_status"] = "deleted"
+        city.setdefault("registryDeletedAt", _now_iso())
+        city["registry_deleted_at"] = city["registryDeletedAt"]
+        return False, "Связанная публикация реестра удалена или недоступна."
+
     try:
         if thread.archived:
             await thread.edit(archived=False, reason=f"Обновление карточки города {city_id}")
-        message = await thread.fetch_message(int(city.get("registry_message_id", 0)))
-        await message.edit(
-            content=f"`{city_id}` • Официальная карточка города FunFernus",
+        message_id = _get_message_id(city, "registryMessageId", "registry_message_id")
+        message = await thread.fetch_message(message_id)
+        await _edit_message_card(
+            message,
+            kind="registry",
             embed=city_registry_embed(city_id, city, state),
-            allowed_mentions=discord.AllowedMentions.none(),
+            state=state,
+            city=city,
+            content=f"`{city_id}` • Официальная карточка города FunFernus",
+        )
+        screenshot_message, screenshot_text = await _edit_screenshot_message(
+            thread,
+            _get_message_id(city, "registryScreenshotsMessageId", "registry_screenshots_message_id"),
+            city_id,
+            city,
+            context="официальный реестр",
+        )
+        _set_message_id(
+            city,
+            "registryScreenshotsMessageId",
+            "registry_screenshots_message_id",
+            screenshot_message.id if screenshot_message else 0,
         )
         if rename_thread:
             await thread.edit(name=str(city.get("name", city_id))[:100], reason=f"Переименование города {city_id}")
+        city["registryStatus"] = "active"
+        city["registry_status"] = "active"
+        return True, f"Карточка реестра обновлена. {screenshot_text}"
+    except discord.NotFound:
+        city["registryStatus"] = "message_deleted"
+        city["registry_status"] = "message_deleted"
+        return False, "Основная карточка публикации была удалена вручную."
     except discord.Forbidden:
-        return False, "Боту не хватает прав для изменения темы реестра."
+        city["registryStatus"] = "unavailable"
+        city["registry_status"] = "unavailable"
+        return False, "Боту не хватает прав для изменения публикации реестра."
     except discord.HTTPException as exc:
+        city["registryStatus"] = "unavailable"
+        city["registry_status"] = "unavailable"
         return False, f"Discord не обновил карточку реестра: {exc}"
-    return True, "Карточка реестра обновлена."
 
 
 async def create_registry_post(
@@ -359,32 +1149,40 @@ async def create_registry_post(
     state: UnifiedState,
     city_id: str,
     city: dict[str, Any],
-) -> tuple[discord.Thread | None, discord.Message | None, str]:
+) -> tuple[discord.Thread | None, discord.Message | None, discord.Message | None, str]:
     forum = await _forum_channel(bot, state.channels.get("city_registry", 0))
     if forum is None:
-        return None, None, "Форум-канал реестра не настроен или недоступен."
+        return None, None, None, "Форум-канал реестра не настроен или недоступен."
 
     kwargs: dict[str, Any] = {}
     if bool(getattr(forum.flags, "require_tag", False)):
         available = [tag for tag in forum.available_tags if not tag.moderated] or list(forum.available_tags)
         if not available:
-            return None, None, "В форуме обязателен тег, но доступных тегов нет."
+            return None, None, None, "В форуме обязателен тег, но доступных тегов нет."
         kwargs["applied_tags"] = [available[0]]
 
+    embeds, banner_file = _message_payload("registry", city_registry_embed(city_id, city, state), city=city, state=state)
     try:
         created = await forum.create_thread(
             name=str(city.get("name", city_id))[:100],
             content=f"`{city_id}` • Официальная карточка города FunFernus",
-            embed=city_registry_embed(city_id, city, state),
+            embeds=embeds,
+            file=banner_file,
             allowed_mentions=discord.AllowedMentions.none(),
             reason=f"Одобрена регистрация города {city_id}",
             **kwargs,
         )
+        screenshot_message = await _send_screenshot_message(
+            created.thread,
+            city_id,
+            city,
+            context="официальный реестр",
+        )
     except discord.Forbidden:
-        return None, None, "Боту не хватает прав для создания публикаций в форуме реестра."
+        return None, None, None, "Боту не хватает прав для создания публикаций в форуме реестра."
     except discord.HTTPException as exc:
-        return None, None, f"Discord не создал карточку реестра: {exc}"
-    return created.thread, created.message, "Карточка реестра создана."
+        return None, None, None, f"Discord не создал карточку реестра: {exc}"
+    return created.thread, created.message, screenshot_message, "Карточка реестра создана."
 
 
 class MayorSelect(discord.ui.UserSelect):
@@ -420,7 +1218,12 @@ class MayorDeputyView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.applicant_id:
-            await interaction.response.send_message("❌ Эта форма открыта другим пользователем.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Форма недоступна",
+                description="Эта форма выбора руководства открыта другим пользователем.",
+            )
             return False
         return True
 
@@ -428,26 +1231,66 @@ class MayorDeputyView(discord.ui.View):
     async def continue_form(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.guild is None:
             return
+        state = self.store.get(interaction.guild.id)
+        if state is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Хранилище недоступно",
+                description="Служебные данные бота ещё не загружены.",
+            )
+            return
         if not self.mayor_id or not self.deputy_id:
-            await interaction.response.send_message("❌ Выберите мэра и заместителя.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Руководство не выбрано",
+                description="Отдельно выберите мэра и заместителя через два меню пользователей Discord.",
+                state=state,
+            )
             return
         if self.mayor_id == self.deputy_id:
-            await interaction.response.send_message("❌ Мэр и заместитель должны быть разными пользователями.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нельзя выбрать одного человека",
+                description="Мэр и заместитель должны быть разными участниками сервера.",
+                state=state,
+            )
             return
         mayor = await _member(interaction.guild, self.mayor_id)
         deputy = await _member(interaction.guild, self.deputy_id)
         if mayor is None or deputy is None or mayor.bot or deputy.bot:
-            await interaction.response.send_message("❌ Выберите двух обычных участников сервера.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Некорректный выбор",
+                description="Оба руководителя должны быть обычными участниками именно этого Discord-сервера.",
+                state=state,
+            )
             return
-        if self.mayor_id != interaction.user.id and not _is_admin(interaction, getattr(self.bot, "admin_user_ids", set())):
-            await interaction.response.send_message("❌ Заявку должен отправлять выбранный мэр.", ephemeral=True)
-            return
-        state = self.store.get(interaction.guild.id)
-        if state is None:
-            await interaction.response.send_message("❌ Хранилище бота не загружено.", ephemeral=True)
+        if self.mayor_id != interaction.user.id and not _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        ):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Отправитель не является мэром",
+                description="Обычную заявку должен отправлять выбранный мэр. Администрация может подать её от имени игрока.",
+                state=state,
+            )
             return
         if _has_active_city(state, self.mayor_id):
-            await interaction.response.send_message("❌ У выбранного мэра уже есть город или заявка на рассмотрении.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ У мэра уже есть город",
+                description="У выбранного мэра уже имеется активный город или заявка на рассмотрении.",
+                state=state,
+            )
             return
         await interaction.response.send_modal(
             CityDetailsModal(self.bot, self.store, self.applicant_id, self.mayor_id, self.deputy_id)
@@ -508,46 +1351,66 @@ class CityDetailsModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or interaction.user.id != self.applicant_id:
-            await interaction.response.send_message("❌ Эта форма больше недоступна.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Форма устарела",
+                description="Начните регистрацию города заново через официальную панель.",
+            )
             return
         state = self.store.get(interaction.guild.id)
         if state is None:
-            await interaction.response.send_message("❌ Хранилище бота не загружено.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Хранилище недоступно",
+                description="Служебные данные бота ещё не загружены.",
+            )
             return
         name = str(self.name_input).strip()
         if _name_taken(state, name):
-            await interaction.response.send_message("❌ Город с таким названием уже зарегистрирован или рассматривается.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Название занято",
+                description="Город с таким названием уже зарегистрирован или находится на рассмотрении.",
+                state=state,
+            )
             return
         if _has_active_city(state, self.mayor_id):
-            await interaction.response.send_message("❌ У выбранного мэра уже есть город или активная заявка.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Заявка уже существует",
+                description="У выбранного мэра уже появился активный город или заявка.",
+                state=state,
+            )
             return
 
         token = secrets.token_hex(8)
-        state.city_drafts[str(interaction.user.id)] = {
+        draft = {
             "token": token,
             "applicant_id": interaction.user.id,
-            "mayor_id": self.mayor_id,
-            "deputy_id": self.deputy_id,
             "name": name,
             "style": str(self.style_input).strip(),
             "overworld_coords": str(self.overworld_input).strip(),
             "nether_coords": str(self.nether_input).strip(),
             "description": str(self.description_input).strip(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": _now_iso(),
         }
+        _set_leaders(draft, self.mayor_id, self.deputy_id)
+        state.city_drafts[str(interaction.user.id)] = draft
         await self.store.save(state)
-        embed = discord.Embed(
+        await _send_interaction_card(
+            interaction,
+            kind="application",
             title="📸 Последний этап регистрации",
             description=(
-                "Прикрепите изображения первых построек или вставьте прямые ссылки. "
-                "После отправки заявка сразу попадёт администрации."
+                "Прикрепите настоящие файлы скриншотов первых построек. Внешние ссылки не принимаются: "
+                "бот сохранит изображения локально и отправит администрации отдельным сообщением-вложением."
             ),
-            color=int(state.options.get("accent_color", 0x19B9D1)),
-        )
-        await interaction.response.send_message(
-            embed=embed,
+            state=state,
             view=CityScreenshotsView(self.bot, self.store, interaction.user.id, token),
-            ephemeral=True,
         )
 
 
@@ -561,11 +1424,16 @@ class CityScreenshotsView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.applicant_id:
-            await interaction.response.send_message("❌ Эта форма открыта другим пользователем.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Форма недоступна",
+                description="Эта форма открыта другим пользователем.",
+            )
             return False
         return True
 
-    @discord.ui.button(label="Добавить скриншоты и отправить", emoji="📸", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Прикрепить скриншоты и отправить", emoji="📸", style=discord.ButtonStyle.success)
     async def screenshots(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(
             CityScreenshotsModal(self.bot, self.store, self.applicant_id, self.token)
@@ -581,151 +1449,230 @@ class CityScreenshotsModal(discord.ui.Modal):
         self.token = token
         self.files_label = discord.ui.Label(
             text="Файлы изображений",
-            description="До 5 изображений PNG/JPG/WEBP/GIF, каждое до 10 МБ.",
+            description="От 1 до 10 изображений PNG/JPG/WEBP/GIF, каждое до 10 МБ.",
             component=discord.ui.FileUpload(
                 custom_id="city_application_screenshots",
-                required=False,
-                min_values=0,
-                max_values=5,
-            ),
-        )
-        self.links_label = discord.ui.Label(
-            text="Ссылки на изображения",
-            description="Необязательно. Каждую ссылку укажите с новой строки.",
-            component=discord.ui.TextInput(
-                custom_id="city_application_screenshot_links",
-                style=discord.TextStyle.paragraph,
-                required=False,
-                max_length=1800,
-                placeholder="https://...",
+                required=True,
+                min_values=1,
+                max_values=MAX_SCREENSHOTS,
             ),
         )
         self.add_item(self.files_label)
-        self.add_item(self.links_label)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or interaction.user.id != self.applicant_id:
-            await interaction.response.send_message("❌ Эта форма больше недоступна.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Форма устарела",
+                description="Начните регистрацию города заново.",
+            )
             return
         state = self.store.get(interaction.guild.id)
         if state is None:
-            await interaction.response.send_message("❌ Хранилище бота не загружено.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Хранилище недоступно",
+                description="Служебные данные бота ещё не загружены.",
+            )
             return
         draft = state.city_drafts.get(str(interaction.user.id))
         if not draft or draft.get("token") != self.token:
-            await interaction.response.send_message("❌ Черновик заявки не найден. Начните регистрацию заново.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Черновик не найден",
+                description="Начните регистрацию заново через официальную панель.",
+                state=state,
+            )
             return
         review = await _text_channel(self.bot, state.channels.get("city_review", 0))
         if review is None:
-            await interaction.response.send_message("❌ Канал рассмотрения городов ещё не настроен.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Канал модерации недоступен",
+                description="Администрация ещё не настроила канал рассмотрения городов.",
+                state=state,
+            )
             return
-        if _has_active_city(state, int(draft.get("mayor_id", 0))) or _name_taken(state, str(draft.get("name", ""))):
-            await interaction.response.send_message("❌ Пока вы заполняли форму, такая заявка уже появилась.", ephemeral=True)
+        if _has_active_city(state, _mayor_id(draft)) or _name_taken(state, str(draft.get("name", ""))):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Данные уже заняты",
+                description="Пока форма была открыта, появилась заявка с таким мэром или названием.",
+                state=state,
+            )
             return
 
         file_component = self.files_label.component
         attachments = list(file_component.values) if isinstance(file_component, discord.ui.FileUpload) else []
-        links_component = self.links_label.component
-        raw_links = str(links_component.value).strip() if isinstance(links_component, discord.ui.TextInput) else ""
-        external_links = _split_urls(raw_links)
-        if not attachments and not external_links:
-            await interaction.response.send_message("❌ Прикрепите хотя бы один скриншот или укажите ссылку.", ephemeral=True)
+        if not attachments:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет скриншотов",
+                description="Прикрепите хотя бы один настоящий файл изображения.",
+                state=state,
+            )
             return
-
         for attachment in attachments:
             try:
-                self.store.validate_image(attachment)
+                _validate_attachment(attachment)
             except ValueError as exc:
-                await interaction.response.send_message(f"❌ `{attachment.filename}`: {exc}", ephemeral=True)
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Некорректный файл",
+                    description=f"`{attachment.filename}`: {exc}.",
+                    state=state,
+                )
                 return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        saved_assets: list[AssetRef] = []
+        city_id = state.next_id("city", "CITY")
+        folder = _city_upload_folder(interaction.guild.id, city_id) / "screenshots"
+        saved_paths: list[str] = []
         try:
-            for index, attachment in enumerate(attachments, 1):
-                saved_assets.append(
-                    await self.store.persist_asset(
-                        interaction.guild,
-                        attachment,
-                        f"Заявка города {draft.get('name', '')} • скриншот {index}",
-                    )
+            for index, attachment in enumerate(attachments[:MAX_SCREENSHOTS], 1):
+                suffix = _safe_extension(attachment.filename, attachment.content_type or "")
+                saved_paths.append(
+                    await _save_attachment_local(attachment, folder / f"screenshot_{index:02d}{suffix}")
                 )
-        except Exception as exc:
-            for asset in saved_assets:
-                await _delete_asset_message(self.store, interaction.guild, asset.message_id)
-            await interaction.followup.send(f"❌ Не удалось сохранить скриншоты: `{exc}`", ephemeral=True)
+        except (ValueError, OSError, discord.HTTPException) as exc:
+            shutil.rmtree(_city_upload_folder(interaction.guild.id, city_id), ignore_errors=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Скриншоты не сохранены",
+                description=f"Локальное сохранение завершилось ошибкой: `{exc}`",
+                state=state,
+                followup=True,
+            )
             return
 
-        screenshots = [asset.url for asset in saved_assets] + external_links
-        city_id = state.next_id("city", "CITY")
         city: dict[str, Any] = {
             **draft,
             "id": city_id,
             "status": "pending",
-            "screenshots": screenshots[:10],
-            "screenshot_assets": [asset.__dict__ for asset in saved_assets],
-            "banner_url": "",
-            "banner_asset": {},
             "question_history": [],
             "active_question": {},
             "review_channel_id": review.id,
-            "review_message_id": 0,
-            "registry_thread_id": 0,
-            "registry_message_id": 0,
-            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "submitted_at": _now_iso(),
+            "bannerPath": "",
+            "banner_path": "",
+            "banner_url": "",
+            "screenshots": [],
+            "screenshot_assets": [],
+            "mayorPresent": True,
+            "deputyPresent": True,
+            "registryStatus": "not_created",
+            "registry_status": "not_created",
         }
         city.pop("token", None)
+        _set_leaders(city, _mayor_id(draft), _deputy_id(draft))
+        _set_paths(city, "screenshotPaths", "screenshot_paths", saved_paths)
+        for camel, snake in (
+            ("reviewMessageId", "review_message_id"),
+            ("reviewScreenshotsMessageId", "review_screenshots_message_id"),
+            ("registryThreadId", "registry_thread_id"),
+            ("registryMessageId", "registry_message_id"),
+            ("registryScreenshotsMessageId", "registry_screenshots_message_id"),
+        ):
+            _set_message_id(city, camel, snake, 0)
+        _refresh_allowed_writers(
+            interaction.guild,
+            state,
+            city,
+            getattr(self.bot, "admin_user_ids", set()),
+            self.bot.user.id if self.bot.user else 0,
+        )
         state.cities[city_id] = city
         state.city_drafts.pop(str(interaction.user.id), None)
-        try:
-            await self.store.save(state)
-        except Exception as exc:
-            state.cities.pop(city_id, None)
-            state.city_drafts[str(interaction.user.id)] = draft
-            for asset in saved_assets:
-                await _delete_asset_message(self.store, interaction.guild, asset.message_id)
-            await interaction.followup.send(f"❌ Не удалось сохранить заявку: `{exc}`", ephemeral=True)
-            return
 
+        main_message: discord.Message | None = None
+        screenshots_message: discord.Message | None = None
         try:
-            message = await review.send(
+            main_message = await _send_channel_card(
+                review,
+                kind="moderation",
                 embed=city_review_embed(city_id, city, state),
+                state=state,
+                city=city,
                 view=CityReviewView(self.bot, self.store, city_id),
-                allowed_mentions=discord.AllowedMentions.none(),
             )
-        except discord.HTTPException as exc:
-            state.cities.pop(city_id, None)
-            state.city_drafts[str(interaction.user.id)] = draft
-            try:
-                await self.store.save(state)
-            except Exception:
-                log.exception("Не удалось откатить заявку города %s после ошибки отправки", city_id)
-            for asset in saved_assets:
-                await _delete_asset_message(self.store, interaction.guild, asset.message_id)
-            await interaction.followup.send(f"❌ Не удалось отправить заявку администрации: `{exc}`", ephemeral=True)
-            return
-
-        city["review_message_id"] = message.id
-        try:
+            screenshots_message = await _send_screenshot_message(
+                review,
+                city_id,
+                city,
+                context="материалы заявки",
+            )
+            _set_message_id(city, "reviewMessageId", "review_message_id", main_message.id)
+            _set_message_id(
+                city,
+                "reviewScreenshotsMessageId",
+                "review_screenshots_message_id",
+                screenshots_message.id if screenshots_message else 0,
+            )
             await self.store.save(state)
         except Exception as exc:
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                pass
+            if main_message is not None:
+                try:
+                    _bot_deleted_messages.add(main_message.id)
+                    await main_message.delete()
+                except discord.HTTPException:
+                    pass
+            if screenshots_message is not None:
+                try:
+                    _bot_deleted_messages.add(screenshots_message.id)
+                    await screenshots_message.delete()
+                except discord.HTTPException:
+                    pass
             state.cities.pop(city_id, None)
             state.city_drafts[str(interaction.user.id)] = draft
+            shutil.rmtree(_city_upload_folder(interaction.guild.id, city_id), ignore_errors=True)
             try:
                 await self.store.save(state)
             except Exception:
-                log.exception("Не удалось откатить заявку города %s после ошибки финального сохранения", city_id)
-            for asset in saved_assets:
-                await _delete_asset_message(self.store, interaction.guild, asset.message_id)
-            await interaction.followup.send(f"❌ Не удалось завершить регистрацию заявки: `{exc}`", ephemeral=True)
+                log.exception("Не удалось откатить заявку города %s", city_id)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Заявка не отправлена",
+                description=f"Discord или хранилище вернули ошибку: `{exc}`",
+                state=state,
+                followup=True,
+            )
             return
-        await interaction.followup.send(
-            f"✅ Заявка `{city_id}` отправлена администрации. Решение и вопросы придут мэру в личные сообщения.",
-            ephemeral=True,
+
+        await _send_city_log(
+            self.bot,
+            state,
+            title="📨 Подана заявка на регистрацию города",
+            description=(
+                f"Заявку отправил <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+                f"Мэр: <@{_mayor_id(city)}> (`{_mayor_id(city)}`).\n"
+                f"Заместитель: <@{_deputy_id(city)}> (`{_deputy_id(city)}`).\n"
+                f"Локально сохранено скриншотов: **{len(saved_paths)}**."
+            ),
+            city_id=city_id,
+            city=city,
+            color=0xF2B84B,
+        )
+        await _send_interaction_card(
+            interaction,
+            kind="notification",
+            title="✅ Заявка отправлена",
+            description=(
+                f"Заявка `{city_id}` передана администрации. Основная карточка и скриншоты отправлены "
+                "двумя отдельными сообщениями без URL-адресов изображений."
+            ),
+            state=state,
+            city=city,
+            followup=True,
+            color=0x59B77A,
         )
 
 
@@ -743,24 +1690,42 @@ class CityApplicationPanelView(discord.ui.View):
     )
     async def register(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.guild is None:
-            await interaction.response.send_message("❌ Регистрация доступна только на сервере.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Недоступно в личных сообщениях",
+                description="Регистрация города выполняется только на сервере FunFernus.",
+            )
             return
         state = self.store.get(interaction.guild.id) or await self.store.load_or_create(interaction.guild)
         if interaction.channel_id != state.channels.get("city_application", 0):
-            await interaction.response.send_message("❌ Используйте официальную панель регистрации городов.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Неофициальная панель",
+                description="Используйте настроенный канал подачи заявок городов.",
+                state=state,
+            )
             return
         if _has_active_city(state, interaction.user.id):
-            await interaction.response.send_message("❌ У вас уже есть город или заявка на рассмотрении.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Активный город уже существует",
+                description="У вас уже есть зарегистрированный город или заявка на рассмотрении.",
+                state=state,
+            )
             return
-        embed = discord.Embed(
+        await _send_interaction_card(
+            interaction,
+            kind="application",
             title="🏰 Выберите руководство города",
-            description="Сначала укажите мэра и заместителя. Заявку должен отправлять выбранный мэр.",
-            color=int(state.options.get("accent_color", 0x19B9D1)),
-        )
-        await interaction.response.send_message(
-            embed=embed,
+            description=(
+                "Сначала отдельно выберите мэра и заместителя через User Select Menu. "
+                "Все права будут навсегда связаны с их Discord ID, а не с ником."
+            ),
+            state=state,
             view=MayorDeputyView(self.bot, self.store, interaction.user.id),
-            ephemeral=True,
         )
 
 
@@ -772,20 +1737,61 @@ class CityReviewView(discord.ui.View):
         self.city_id = city_id
 
     async def guard(self, interaction: discord.Interaction) -> tuple[UnifiedState | None, str, dict[str, Any] | None]:
-        if interaction.guild is None or not _is_admin(interaction, getattr(self.bot, "admin_user_ids", set())):
-            await interaction.response.send_message("❌ Нет доступа к модерации городов.", ephemeral=True)
+        if interaction.guild is None:
             return None, "", None
         state = self.store.get(interaction.guild.id)
-        if state is not None and interaction.channel_id != state.channels.get("city_review", 0):
-            await interaction.response.send_message("❌ Используйте официальный канал рассмотрения городов.", ephemeral=True)
+        if state is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Хранилище недоступно",
+                description="Служебные данные системы городов не загружены.",
+            )
+            return None, "", None
+        if not _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        ):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Модерировать города могут только настроенные администраторы и модераторы.",
+                state=state,
+            )
+            return None, "", None
+        if interaction.channel_id != state.channels.get("city_review", 0):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Неверный канал",
+                description="Используйте официальный канал рассмотрения заявок городов.",
+                state=state,
+            )
             return None, "", None
         city_id = self.city_id or _city_id(interaction.message)
-        city = state.cities.get(city_id) if state and city_id else None
-        if state is None or city is None:
-            await interaction.response.send_message("❌ Заявка города не найдена в хранилище.", ephemeral=True)
+        city = state.cities.get(city_id) if city_id else None
+        if city is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Заявка не найдена",
+                description="Карточка не связана с городом в JSON-хранилище.",
+                state=state,
+            )
             return None, "", None
+        _normalize_city(city)
         if city.get("status") != "pending":
-            await interaction.response.send_message("❌ Эта заявка уже рассмотрена.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Заявка уже рассмотрена",
+                description=f"Текущий статус: **{_status_text(str(city.get('status')))}**.",
+                state=state,
+                city=city,
+            )
             return None, "", None
         return state, city_id, city
 
@@ -801,33 +1807,56 @@ class CityReviewView(discord.ui.View):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with _lock(interaction.guild.id, city_id):
-            if city.get("status") != "pending":
-                await interaction.followup.send("❌ Заявка уже рассмотрена.", ephemeral=True)
+            city = state.cities.get(city_id)
+            if city is None or city.get("status") != "pending":
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Заявка уже рассмотрена",
+                    description="Другой модератор успел обработать её раньше.",
+                    state=state,
+                    followup=True,
+                )
+                return
+            mayor_id = _mayor_id(city)
+            deputy_id = _deputy_id(city)
+            if not mayor_id or not deputy_id or mayor_id == deputy_id:
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Ошибка руководства",
+                    description="В заявке должны быть два разных Discord ID: мэр и заместитель.",
+                    state=state,
+                    city=city,
+                    followup=True,
+                )
+                return
+            mayor = await _member(interaction.guild, mayor_id)
+            deputy = await _member(interaction.guild, deputy_id)
+            if mayor is None or deputy is None:
+                missing = "мэр" if mayor is None else "заместитель"
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Руководитель покинул сервер",
+                    description=f"Нельзя одобрить заявку: {missing} больше не находится на Discord-сервере.",
+                    state=state,
+                    city=city,
+                    followup=True,
+                )
                 return
             role_ids = state.roles.get("city_mayor", [])
             mayor_role = interaction.guild.get_role(role_ids[0]) if role_ids else None
             if mayor_role is None:
-                await interaction.followup.send("❌ Роль мэра не настроена или удалена.", ephemeral=True)
-                return
-            mayor = await _member(interaction.guild, int(city.get("mayor_id", 0)))
-            if mayor is None:
-                await interaction.followup.send("❌ Пользователь-мэр больше не найден на сервере.", ephemeral=True)
-                return
-
-            thread, registry_message, error = await create_registry_post(self.bot, state, city_id, city)
-            if thread is None or registry_message is None:
-                await interaction.followup.send(f"❌ {error}", ephemeral=True)
-                return
-            role_already_present = mayor_role in mayor.roles
-            try:
-                if not role_already_present:
-                    await mayor.add_roles(mayor_role, reason=f"Мэр зарегистрированного города {city_id}")
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                try:
-                    await thread.delete(reason=f"Откат регистрации {city_id}: не выдана роль мэра")
-                except discord.HTTPException:
-                    pass
-                await interaction.followup.send(f"❌ Не удалось выдать роль мэра: `{exc}`", ephemeral=True)
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Роль мэра не настроена",
+                    description="Выберите существующую роль мэра в панели настройки городов.",
+                    state=state,
+                    city=city,
+                    followup=True,
+                )
                 return
 
             previous = copy.deepcopy(city)
@@ -835,55 +1864,130 @@ class CityReviewView(discord.ui.View):
                 {
                     "status": "approved",
                     "reviewer_id": interaction.user.id,
-                    "approved_at": datetime.now(timezone.utc).isoformat(),
-                    "registry_thread_id": thread.id,
-                    "registry_message_id": registry_message.id,
+                    "approved_at": _now_iso(),
                     "active_question": {},
+                    "mayorPresent": True,
+                    "mayor_present": True,
+                    "deputyPresent": True,
+                    "deputy_present": True,
+                    "registryStatus": "active",
+                    "registry_status": "active",
                 }
             )
+            _refresh_allowed_writers(
+                interaction.guild,
+                state,
+                city,
+                getattr(self.bot, "admin_user_ids", set()),
+                self.bot.user.id if self.bot.user else 0,
+            )
+
+            thread: discord.Thread | None = None
+            registry_message: discord.Message | None = None
+            registry_screenshots: discord.Message | None = None
+            role_already_present = mayor_role in mayor.roles
             try:
+                thread, registry_message, registry_screenshots, error = await create_registry_post(
+                    self.bot, state, city_id, city
+                )
+                if thread is None or registry_message is None:
+                    raise RuntimeError(error)
+                if not role_already_present:
+                    await mayor.add_roles(mayor_role, reason=f"Мэр зарегистрированного города {city_id}")
+                _set_message_id(city, "registryThreadId", "registry_thread_id", thread.id)
+                _set_message_id(city, "registryMessageId", "registry_message_id", registry_message.id)
+                _set_message_id(
+                    city,
+                    "registryScreenshotsMessageId",
+                    "registry_screenshots_message_id",
+                    registry_screenshots.id if registry_screenshots else 0,
+                )
                 await self.store.save(state)
             except Exception as exc:
                 state.cities[city_id] = previous
-                if not role_already_present:
+                if not role_already_present and mayor_role in mayor.roles:
                     try:
                         await mayor.remove_roles(mayor_role, reason=f"Откат регистрации города {city_id}")
                     except discord.HTTPException:
-                        log.exception("Не удалось убрать роль мэра при откате города %s", city_id)
-                try:
-                    await thread.delete(reason=f"Откат регистрации {city_id}: данные не сохранены")
-                except discord.HTTPException:
-                    log.exception("Не удалось удалить тему реестра при откате города %s", city_id)
-                await interaction.followup.send(f"❌ Не удалось сохранить регистрацию города: `{exc}`", ephemeral=True)
-                return
-            if interaction.message:
-                try:
-                    await interaction.message.edit(embed=city_review_embed(city_id, city, state), view=None)
-                except discord.HTTPException:
-                    pass
-
-            dm_delivered = True
-            user = await _user(self.bot, int(city.get("mayor_id", 0)))
-            if user is None:
-                dm_delivered = False
-            else:
-                dm = discord.Embed(
-                    title="✅ Город успешно зарегистрирован",
-                    description=(
-                        f"Город **{city.get('name')}** одобрен администрацией FunFernus.\n\n"
-                        f"Вам выдана роль **{mayor_role.name}**, а карточка добавлена в <#{thread.id}>."
-                    ),
-                    color=0x59B77A,
+                        log.exception("Не удалось убрать роль мэра при откате %s", city_id)
+                if thread is not None:
+                    try:
+                        await thread.delete(reason=f"Откат регистрации города {city_id}")
+                    except discord.HTTPException:
+                        log.exception("Не удалось удалить публикацию при откате %s", city_id)
+                await _send_city_log(
+                    self.bot,
+                    state,
+                    title="❌ Ошибка одобрения города",
+                    description=f"Модератор <@{interaction.user.id}> не смог одобрить город: `{exc}`",
+                    city_id=city_id,
+                    city=previous,
+                    color=0xD85C5C,
                 )
-                dm.set_footer(text=f"FunFernus • {city_id}")
-                try:
-                    await user.send(embed=dm)
-                except discord.HTTPException:
-                    dm_delivered = False
-            await interaction.followup.send(
-                f"✅ Город `{city_id}` одобрен и опубликован в <#{thread.id}>."
-                + ("" if dm_delivered else " ⚠️ ЛС мэру закрыты."),
-                ephemeral=True,
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Город не одобрен",
+                    description=f"Операция полностью отменена: `{exc}`",
+                    state=state,
+                    city=previous,
+                    followup=True,
+                )
+                return
+
+            await _edit_review_message(self.bot, state, city_id, city)
+            await _send_city_log(
+                self.bot,
+                state,
+                title="✅ Город одобрен и опубликован",
+                description=(
+                    f"Модератор: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+                    f"Публикация: <#{thread.id}> (`{thread.id}`).\n"
+                    f"Мэр: <@{mayor_id}>. Заместитель: <@{deputy_id}>."
+                ),
+                city_id=city_id,
+                city=city,
+                color=0x59B77A,
+            )
+
+            mayor_dm = _simple_embed(
+                "✅ Город успешно зарегистрирован",
+                (
+                    f"Город **{city.get('name')}** одобрен администрацией FunFernus.\n\n"
+                    f"Вам выдана роль **{mayor_role.name}**, а публикация создана в <#{thread.id}>."
+                ),
+                color=0x59B77A,
+                footer=f"FunFernus • {city_id}",
+            )
+            deputy_dm = _simple_embed(
+                "✅ Вы назначены заместителем мэра",
+                (
+                    f"Город **{city.get('name')}** зарегистрирован. Вы можете писать в его официальной "
+                    f"публикации <#{thread.id}> по своему Discord ID."
+                ),
+                color=0x59B77A,
+                footer=f"FunFernus • {city_id}",
+            )
+            dm_failures: list[str] = []
+            try:
+                await _send_user_card(mayor, kind="notification", embed=mayor_dm, state=state, city=city)
+            except discord.HTTPException:
+                dm_failures.append("мэру")
+            try:
+                await _send_user_card(deputy, kind="notification", embed=deputy_dm, state=state, city=city)
+            except discord.HTTPException:
+                dm_failures.append("заместителю")
+
+            tail = f" ЛС не доставлены: {', '.join(dm_failures)}." if dm_failures else ""
+            await _send_interaction_card(
+                interaction,
+                kind="notification",
+                title="✅ Город одобрен",
+                description=f"Город `{city_id}` опубликован в <#{thread.id}>.{tail}",
+                state=state,
+                city=city,
+                followup=True,
+                color=0x59B77A,
             )
 
     @discord.ui.button(
@@ -905,11 +2009,19 @@ class CityReviewView(discord.ui.View):
     )
     async def question(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state, city_id, city = await self.guard(interaction)
-        if state is not None and city is not None:
-            if city.get("active_question"):
-                await interaction.response.send_message("❌ Мэр ещё не ответил на предыдущий вопрос.", ephemeral=True)
-                return
-            await interaction.response.send_modal(CityQuestionModal(self.bot, self.store, city_id))
+        if state is None or city is None:
+            return
+        if city.get("active_question"):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Вопрос уже ожидает ответа",
+                description="Мэр ещё не ответил на предыдущий вопрос администрации.",
+                state=state,
+                city=city,
+            )
+            return
+        await interaction.response.send_modal(CityQuestionModal(self.bot, self.store, city_id))
 
 
 class CityRejectModal(discord.ui.Modal):
@@ -927,18 +2039,36 @@ class CityRejectModal(discord.ui.Modal):
         self.add_item(self.reason)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not _is_admin(interaction, getattr(self.bot, "admin_user_ids", set())):
-            await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+        if interaction.guild is None:
             return
         state = self.store.get(interaction.guild.id)
         city = state.cities.get(self.city_id) if state else None
-        if state is None or city is None:
-            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+        if state is None or city is None or not _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        ):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Заявка не найдена либо у вас нет прав модерации городов.",
+                state=state,
+            )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with _lock(interaction.guild.id, self.city_id):
-            if city.get("status") != "pending":
-                await interaction.followup.send("❌ Заявка уже рассмотрена.", ephemeral=True)
+            city = state.cities.get(self.city_id)
+            if city is None or city.get("status") != "pending":
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Заявка уже рассмотрена",
+                    description="Другой модератор обработал её раньше.",
+                    state=state,
+                    followup=True,
+                )
                 return
             previous = copy.deepcopy(city)
             city.update(
@@ -946,7 +2076,7 @@ class CityRejectModal(discord.ui.Modal):
                     "status": "rejected",
                     "reviewer_id": interaction.user.id,
                     "rejection_reason": str(self.reason).strip(),
-                    "rejected_at": datetime.now(timezone.utc).isoformat(),
+                    "rejected_at": _now_iso(),
                     "active_question": {},
                 }
             )
@@ -954,27 +2084,53 @@ class CityRejectModal(discord.ui.Modal):
                 await self.store.save(state)
             except Exception as exc:
                 state.cities[self.city_id] = previous
-                await interaction.followup.send(f"❌ Не удалось сохранить отказ: `{exc}`", ephemeral=True)
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Отказ не сохранён",
+                    description=f"Ошибка хранилища: `{exc}`",
+                    state=state,
+                    city=previous,
+                    followup=True,
+                )
                 return
             await _edit_review_message(self.bot, state, self.city_id, city)
-            dm_delivered = True
-            user = await _user(self.bot, int(city.get("mayor_id", 0)))
-            if user is None:
-                dm_delivered = False
+            await _send_city_log(
+                self.bot,
+                state,
+                title="❌ Заявка города отклонена",
+                description=(
+                    f"Модератор: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+                    f"Причина: {_trim(self.reason, 1500)}"
+                ),
+                city_id=self.city_id,
+                city=city,
+                color=0xD85C5C,
+            )
+            mayor = await _user(self.bot, _mayor_id(city))
+            delivered = True
+            if mayor is None:
+                delivered = False
             else:
-                embed = discord.Embed(
-                    title="❌ Регистрация города отклонена",
-                    description=f"Заявка города **{city.get('name')}** отклонена.\n\n**Причина:**\n{str(self.reason).strip()}",
+                dm = _simple_embed(
+                    "❌ Регистрация города отклонена",
+                    f"Заявка города **{city.get('name')}** отклонена.\n\n**Причина:**\n{str(self.reason).strip()}",
                     color=0xD85C5C,
+                    footer=f"FunFernus • {self.city_id}",
                 )
-                embed.set_footer(text=f"FunFernus • {self.city_id}")
                 try:
-                    await user.send(embed=embed)
+                    await _send_user_card(mayor, kind="warning", embed=dm, state=state, city=city)
                 except discord.HTTPException:
-                    dm_delivered = False
-            await interaction.followup.send(
-                "✅ Отказ сохранён и отправлен мэру." if dm_delivered else "✅ Отказ сохранён. ⚠️ ЛС мэру закрыты.",
-                ephemeral=True,
+                    delivered = False
+            await _send_interaction_card(
+                interaction,
+                kind="notification",
+                title="✅ Отказ сохранён",
+                description="Причина отправлена мэру." if delivered else "Причина сохранена, но личные сообщения мэра недоступны.",
+                state=state,
+                city=city,
+                followup=True,
+                color=0x59B77A,
             )
 
 
@@ -993,75 +2149,121 @@ class CityQuestionModal(discord.ui.Modal):
         self.add_item(self.question)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not _is_admin(interaction, getattr(self.bot, "admin_user_ids", set())):
-            await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+        if interaction.guild is None:
             return
         state = self.store.get(interaction.guild.id)
         city = state.cities.get(self.city_id) if state else None
-        if state is None or city is None or city.get("status") != "pending":
-            await interaction.response.send_message("❌ Активная заявка не найдена.", ephemeral=True)
+        if state is None or city is None or not _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        ):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Активная заявка не найдена или у вас нет прав.",
+                state=state,
+            )
             return
-        if city.get("active_question"):
-            await interaction.response.send_message("❌ Мэр ещё не ответил на предыдущий вопрос.", ephemeral=True)
+        if city.get("status") != "pending" or city.get("active_question"):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нельзя задать вопрос",
+                description="Заявка уже рассмотрена либо предыдущий вопрос ещё ожидает ответа.",
+                state=state,
+                city=city,
+            )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         question = str(self.question).strip()
         async with _lock(interaction.guild.id, self.city_id):
             city = state.cities.get(self.city_id)
-            if city is None or city.get("status") != "pending":
-                await interaction.followup.send("❌ Заявка уже рассмотрена или удалена.", ephemeral=True)
+            if city is None or city.get("status") != "pending" or city.get("active_question"):
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Состояние заявки изменилось",
+                    description="Обновите канал модерации и повторите действие.",
+                    state=state,
+                    followup=True,
+                )
                 return
-            if city.get("active_question"):
-                await interaction.followup.send("❌ Мэр ещё не ответил на предыдущий вопрос.", ephemeral=True)
+            mayor = await _user(self.bot, _mayor_id(city))
+            if mayor is None:
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Мэр не найден",
+                    description="Пользователь больше недоступен в Discord.",
+                    state=state,
+                    city=city,
+                    followup=True,
+                )
                 return
-            user = await _user(self.bot, int(city.get("mayor_id", 0)))
-            if user is None:
-                await interaction.followup.send("❌ Не удалось найти пользователя-мэра.", ephemeral=True)
-                return
-            embed = discord.Embed(
-                title="❓ Вопрос по заявке города",
-                description=(
-                    f"Администрация задала вопрос по заявке **{city.get('name')}** (`{self.city_id}`).\n\n"
-                    f"**Вопрос:**\n{question}\n\n"
-                    "Ответьте следующим сообщением в этом личном чате. Можно приложить файлы или ссылки."
-                ),
-                color=0x5865F2,
-            )
             item = {
                 "token": secrets.token_hex(6),
                 "question": question,
                 "answer": "",
                 "asked_by": interaction.user.id,
-                "asked_at": datetime.now(timezone.utc).isoformat(),
+                "asked_at": _now_iso(),
+                "answerAttachmentPaths": [],
+                "reviewAnswerMessageId": 0,
+                "reviewAnswerAttachmentsMessageId": 0,
             }
-            previous_active = copy.deepcopy(city.get("active_question", {}))
-            history = city.setdefault("question_history", [])
+            previous = copy.deepcopy(city)
             city["active_question"] = dict(item)
-            history.append(item)
+            city.setdefault("question_history", []).append(item)
             try:
                 await self.store.save(state)
+                dm = _simple_embed(
+                    "❓ Вопрос по заявке города",
+                    (
+                        f"Администрация задала вопрос по заявке **{city.get('name')}** (`{self.city_id}`).\n\n"
+                        f"**Вопрос:**\n{question}\n\n"
+                        "Ответьте следующим сообщением в этом личном чате. Файлы можно приложить — бот сохранит их локально."
+                    ),
+                    color=0x5865F2,
+                    footer=f"FunFernus • {self.city_id}",
+                )
+                await _send_user_card(mayor, kind="notification", embed=dm, state=state, city=city)
             except Exception as exc:
-                city["active_question"] = previous_active
-                if history and history[-1].get("token") == item["token"]:
-                    history.pop()
-                await interaction.followup.send(f"❌ Не удалось сохранить вопрос: `{exc}`", ephemeral=True)
-                return
-
-            try:
-                await user.send(embed=embed)
-            except discord.HTTPException:
-                city["active_question"] = previous_active
-                if history and history[-1].get("token") == item["token"]:
-                    history.pop()
+                state.cities[self.city_id] = previous
                 try:
                     await self.store.save(state)
                 except Exception:
-                    log.exception("Не удалось откатить вопрос по заявке города %s", self.city_id)
-                await interaction.followup.send("❌ Личные сообщения мэра закрыты. Вопрос не сохранён.", ephemeral=True)
+                    log.exception("Не удалось откатить вопрос по заявке %s", self.city_id)
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Вопрос не отправлен",
+                    description=f"Личные сообщения мэра недоступны или возникла ошибка: `{exc}`",
+                    state=state,
+                    city=previous,
+                    followup=True,
+                )
                 return
-
             await _edit_review_message(self.bot, state, self.city_id, city)
-        await interaction.followup.send("✅ Вопрос отправлен мэру. Заявка остаётся на рассмотрении.", ephemeral=True)
+            await _send_city_log(
+                self.bot,
+                state,
+                title="❓ Администрация задала вопрос мэру",
+                description=f"Автор: <@{interaction.user.id}> (`{interaction.user.id}`).\nВопрос: {_trim(question, 1500)}",
+                city_id=self.city_id,
+                city=city,
+            )
+        await _send_interaction_card(
+            interaction,
+            kind="notification",
+            title="✅ Вопрос отправлен",
+            description="Заявка остаётся на рассмотрении до ответа мэра.",
+            state=state,
+            city=city,
+            followup=True,
+            color=0x59B77A,
+        )
 
 
 class CityManagementLauncherView(discord.ui.View):
@@ -1079,25 +2281,61 @@ class CityManagementLauncherView(discord.ui.View):
     async def open_management(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.guild is None:
             return
-        state = self.store.get(interaction.guild.id) or await self.store.load_or_create(interaction.guild)
+        state = self.store.get(interaction.guild.id)
+        if state is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Хранилище недоступно",
+                description="Система городов ещё не загружена.",
+            )
+            return
         if interaction.channel_id != state.channels.get("city_management", 0):
-            await interaction.response.send_message("❌ Используйте настроенный канал управления городом.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Неверный канал",
+                description="Используйте официальный канал управления городом.",
+                state=state,
+            )
             return
         found = _find_city_for_mayor(state, interaction.user.id)
         if found is None:
-            await interaction.response.send_message("❌ За вашим Discord-аккаунтом не найден зарегистрированный город.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Город не найден",
+                description="К вашему Discord ID не привязан зарегистрированный город, в котором вы являетесь мэром.",
+                state=state,
+            )
             return
-        role_ids = state.roles.get("city_mayor", [])
-        if isinstance(interaction.user, discord.Member) and role_ids:
-            if not any(role.id in set(role_ids) for role in interaction.user.roles):
-                await interaction.response.send_message("❌ У вас нет настроенной роли мэра.", ephemeral=True)
-                return
         city_id, city = found
-        await interaction.response.send_message(
-            embed=city_management_embed(city_id, city, state),
+        role_ids = state.roles.get("city_mayor", [])
+        if isinstance(interaction.user, discord.Member) and role_ids and not any(role.id in role_ids for role in interaction.user.roles):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет роли мэра",
+                description="Связь с городом найдена, но роль мэра отсутствует. Обратитесь к администрации.",
+                state=state,
+                city=city,
+            )
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="management",
+            title=city_management_embed(city_id, city, state).title or "Управление городом",
+            description=(
+                "Ниже доступны кнопки редактирования. Текущие сведения показаны в дополнительной карточке."
+            ),
+            state=state,
+            city=city,
             view=CityManagementView(self.bot, self.store, city_id, interaction.user.id),
-            ephemeral=True,
         )
+        # Ephemeral follow-up с полными полями панели, также с большим локальным баннером.
+        content_embed = city_management_embed(city_id, city, state)
+        embeds, file = _message_payload("management", content_embed, city=city, state=state)
+        await interaction.followup.send(embeds=embeds, file=file, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 class CityManagementView(discord.ui.View):
@@ -1110,18 +2348,29 @@ class CityManagementView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None or interaction.user.id != self.mayor_id:
-            await interaction.response.send_message("❌ Эта панель принадлежит другому мэру.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Эта панель открыта другому мэру и проверяет доступ только по Discord ID.",
+            )
             return False
         state = self.store.get(interaction.guild.id)
         city = state.cities.get(self.city_id) if state else None
-        if city is None or city.get("status") != "approved" or int(city.get("mayor_id", 0)) != interaction.user.id:
-            await interaction.response.send_message("❌ Связь с городом больше не найдена.", ephemeral=True)
+        if city is None or city.get("status") != "approved" or _mayor_id(city) != interaction.user.id:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Доступ изменился",
+                description="Вы больше не являетесь мэром этого города либо город недоступен.",
+                state=state,
+            )
             return False
         return True
 
-    @discord.ui.button(label="Изменить название города", emoji="✏️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Изменить название", emoji="✏️", style=discord.ButtonStyle.primary)
     async def rename(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        state = self.store.get(interaction.guild_id or 0)
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
         city = state.cities.get(self.city_id) if state else {}
         await interaction.response.send_modal(
             CityRenameModal(
@@ -1133,9 +2382,9 @@ class CityManagementView(discord.ui.View):
             )
         )
 
-    @discord.ui.button(label="Изменить описание", emoji="📝", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Изменить описание", emoji="📝", style=discord.ButtonStyle.primary)
     async def description(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        state = self.store.get(interaction.guild_id or 0)
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
         city = state.cities.get(self.city_id) if state else {}
         await interaction.response.send_modal(
             CityDescriptionModal(
@@ -1147,13 +2396,13 @@ class CityManagementView(discord.ui.View):
             )
         )
 
-    @discord.ui.button(label="Установить / заменить баннер", emoji="🖼️", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Главный баннер", emoji="🖼️", style=discord.ButtonStyle.success)
     async def banner(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(CityBannerModal(self.bot, self.store, self.city_id, self.mayor_id))
 
-    @discord.ui.button(label="Координаты и прочие данные", emoji="🧭", style=discord.ButtonStyle.primary, row=1)
-    async def details(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        state = self.store.get(interaction.guild_id or 0)
+    @discord.ui.button(label="Координаты и данные", emoji="🧭", style=discord.ButtonStyle.secondary)
+    async def data(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
         city = state.cities.get(self.city_id) if state else {}
         await interaction.response.send_modal(
             CityEditDataModal(
@@ -1165,6 +2414,29 @@ class CityManagementView(discord.ui.View):
             )
         )
 
+    @discord.ui.button(label="Обновить статус", emoji="🔄", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None:
+            return
+        await _audit_city_state(
+            self.bot,
+            self.store,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        )
+        embeds, file = _message_payload("management", city_management_embed(self.city_id, city, state), city=city, state=state)
+        await interaction.response.send_message(
+            embeds=embeds,
+            file=file,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
 
 async def _management_guard(
     interaction: discord.Interaction,
@@ -1173,12 +2445,23 @@ async def _management_guard(
     mayor_id: int,
 ) -> tuple[UnifiedState | None, dict[str, Any] | None]:
     if interaction.guild is None or interaction.user.id != mayor_id:
-        await interaction.response.send_message("❌ Нет доступа к этому городу.", ephemeral=True)
+        await _send_interaction_card(
+            interaction,
+            kind="warning",
+            title="❌ Нет доступа",
+            description="Панель привязана к другому Discord ID.",
+        )
         return None, None
     state = store.get(interaction.guild.id)
     city = state.cities.get(city_id) if state else None
-    if state is None or city is None or city.get("status") != "approved" or int(city.get("mayor_id", 0)) != mayor_id:
-        await interaction.response.send_message("❌ Город не найден.", ephemeral=True)
+    if state is None or city is None or city.get("status") != "approved" or _mayor_id(city) != mayor_id:
+        await _send_interaction_card(
+            interaction,
+            kind="warning",
+            title="❌ Город недоступен",
+            description="Город не найден или руководство было изменено администрацией.",
+            state=state,
+        )
         return None, None
     return state, city
 
@@ -1194,26 +2477,30 @@ async def _save_and_sync(
     *,
     rename_thread: bool = False,
 ) -> tuple[bool, str]:
-    city["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await store.save(state)
-    ok, text = await sync_registry_post(bot, state, city_id, city, rename_thread=rename_thread)
-    if not ok:
-        state.cities[city_id] = previous
+    city["updated_at"] = _now_iso()
+    try:
         await store.save(state)
-        restored, restore_text = await sync_registry_post(
+    except Exception as exc:
+        state.cities[city_id] = previous
+        return False, f"Изменения не сохранены: {exc}"
+
+    ok, text = await sync_registry_post(bot, state, city_id, city, rename_thread=rename_thread)
+    try:
+        await store.save(state)
+    except Exception:
+        log.exception("Не удалось сохранить статус синхронизации города %s", city_id)
+    await _edit_review_message(bot, state, city_id, city)
+    if not ok:
+        await _send_city_log(
             bot,
             state,
-            city_id,
-            previous,
-            rename_thread=rename_thread,
+            title="⚠️ Данные города сохранены без синхронизации",
+            description=f"Изменения внесены, но публикация не обновилась: {text}",
+            city_id=city_id,
+            city=city,
+            color=0xF2B84B,
         )
-        if not restored:
-            log.error(
-                "Не удалось восстановить публичную карточку города %s после ошибки обновления: %s",
-                city_id,
-                restore_text,
-            )
-        return False, text
+        return True, f"Данные сохранены. ⚠️ {text}"
     return True, text
 
 
@@ -1225,9 +2512,9 @@ class CityRenameModal(discord.ui.Modal):
         city_id: str,
         mayor_id: int,
         *,
-        current_name: str = "",
+        current_name: str,
     ) -> None:
-        super().__init__(title="Изменить название города", timeout=600)
+        super().__init__(title="Изменение названия города", timeout=600)
         self.bot = bot
         self.store = store
         self.city_id = city_id
@@ -1236,7 +2523,7 @@ class CityRenameModal(discord.ui.Modal):
             label="Новое название",
             min_length=1,
             max_length=20,
-            default=current_name[:20] or None,
+            default=current_name[:20],
         )
         self.add_item(self.name_input)
 
@@ -1246,14 +2533,32 @@ class CityRenameModal(discord.ui.Modal):
             return
         name = str(self.name_input).strip()
         if _name_taken(state, name, exclude=self.city_id):
-            await interaction.response.send_message("❌ Такое название уже используется.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Название занято",
+                description="Другой действующий город уже использует это название.",
+                state=state,
+                city=city,
+            )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with _lock(state.guild_id, self.city_id):
             previous = copy.deepcopy(city)
             city["name"] = name
-            ok, text = await _save_and_sync(interaction, self.bot, self.store, state, self.city_id, city, previous, rename_thread=True)
-        await interaction.followup.send(("✅ " if ok else "❌ ") + text, ephemeral=True)
+            ok, text = await _save_and_sync(
+                interaction, self.bot, self.store, state, self.city_id, city, previous, rename_thread=True
+            )
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Название изменено" if ok else "❌ Ошибка изменения",
+            description=text,
+            state=state,
+            city=city if ok else previous,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
 
 
 class CityDescriptionModal(discord.ui.Modal):
@@ -1264,19 +2569,19 @@ class CityDescriptionModal(discord.ui.Modal):
         city_id: str,
         mayor_id: int,
         *,
-        current_description: str = "",
+        current_description: str,
     ) -> None:
-        super().__init__(title="Изменить описание города", timeout=600)
+        super().__init__(title="Изменение описания города", timeout=600)
         self.bot = bot
         self.store = store
         self.city_id = city_id
         self.mayor_id = mayor_id
         self.description_input = discord.ui.TextInput(
-            label="Новое описание",
+            label="Описание и концепция",
             style=discord.TextStyle.paragraph,
             min_length=10,
             max_length=2000,
-            default=current_description[:2000] or None,
+            default=current_description[:2000],
         )
         self.add_item(self.description_input)
 
@@ -1289,7 +2594,16 @@ class CityDescriptionModal(discord.ui.Modal):
             previous = copy.deepcopy(city)
             city["description"] = str(self.description_input).strip()
             ok, text = await _save_and_sync(interaction, self.bot, self.store, state, self.city_id, city, previous)
-        await interaction.followup.send(("✅ " if ok else "❌ ") + text, ephemeral=True)
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Описание изменено" if ok else "❌ Ошибка изменения",
+            description=text,
+            state=state,
+            city=city if ok else previous,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
 
 
 class CityBannerModal(discord.ui.Modal):
@@ -1300,70 +2614,92 @@ class CityBannerModal(discord.ui.Modal):
         self.city_id = city_id
         self.mayor_id = mayor_id
         self.file_label = discord.ui.Label(
-            text="Файл баннера",
-            description="PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1600×600.",
+            text="Локальный файл баннера",
+            description="Один большой PNG/JPG/WEBP/GIF до 10 МБ. Внешние ссылки не используются.",
             component=discord.ui.FileUpload(
                 custom_id="city_main_banner_file",
-                required=False,
-                min_values=0,
+                required=True,
+                min_values=1,
                 max_values=1,
             ),
         )
-        self.link_label = discord.ui.Label(
-            text="Или прямая ссылка",
-            description="Используется, если файл не прикреплён.",
-            component=discord.ui.TextInput(
-                custom_id="city_main_banner_url",
-                required=False,
-                max_length=1000,
-                placeholder="https://...",
-            ),
-        )
         self.add_item(self.file_label)
-        self.add_item(self.link_label)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         state, city = await _management_guard(interaction, self.store, self.city_id, self.mayor_id)
         if state is None or city is None or interaction.guild is None:
             return
-        file_component = self.file_label.component
-        attachment = file_component.values[0] if isinstance(file_component, discord.ui.FileUpload) and file_component.values else None
-        link_component = self.link_label.component
-        link = str(link_component.value).strip() if isinstance(link_component, discord.ui.TextInput) else ""
-        if attachment is None and not _valid_url(link):
-            await interaction.response.send_message("❌ Прикрепите изображение или укажите корректную ссылку http/https.", ephemeral=True)
+        component = self.file_label.component
+        attachments = list(component.values) if isinstance(component, discord.ui.FileUpload) else []
+        if not attachments:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Баннер не выбран",
+                description="Прикрепите настоящий файл изображения.",
+                state=state,
+                city=city,
+            )
             return
-        if attachment is not None:
-            try:
-                self.store.validate_image(attachment)
-            except ValueError as exc:
-                await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
-                return
+        attachment = attachments[0]
+        try:
+            _validate_attachment(attachment)
+        except ValueError as exc:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Некорректный баннер",
+                description=str(exc),
+                state=state,
+                city=city,
+            )
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        new_asset = AssetRef()
-        if attachment is not None:
-            try:
-                new_asset = await self.store.persist_asset(
-                    interaction.guild,
-                    attachment,
-                    f"Главный баннер города {city.get('name', self.city_id)}",
-                )
-                link = new_asset.url
-            except Exception as exc:
-                await interaction.followup.send(f"❌ Не удалось сохранить баннер: `{exc}`", ephemeral=True)
-                return
-
+        suffix = _safe_extension(attachment.filename, attachment.content_type or "")
+        destination = _city_upload_folder(interaction.guild.id, self.city_id) / f"main_banner{suffix}"
+        previous = copy.deepcopy(city)
+        old_path = str(city.get("bannerPath", "") or "")
+        try:
+            relative = await _save_attachment_local(attachment, destination)
+        except Exception as exc:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Баннер не сохранён",
+                description=f"Ошибка локального файла: `{exc}`",
+                state=state,
+                city=city,
+                followup=True,
+            )
+            return
         async with _lock(state.guild_id, self.city_id):
-            previous = copy.deepcopy(city)
-            old_asset = AssetRef.from_dict(city.get("banner_asset", {}))
-            city["banner_url"] = link
-            city["banner_asset"] = new_asset.__dict__ if new_asset.url else {}
+            city["bannerPath"] = relative
+            city["banner_path"] = relative
+            city["banner_url"] = ""
+            city["bannerFileStatus"] = "active"
             ok, text = await _save_and_sync(interaction, self.bot, self.store, state, self.city_id, city, previous)
-            if not ok and new_asset.message_id:
-                await _delete_asset_message(self.store, interaction.guild, new_asset.message_id)
-            elif ok and old_asset.message_id:
-                await _delete_asset_message(self.store, interaction.guild, old_asset.message_id)
-        await interaction.followup.send(("✅ Баннер сохранён. " if ok else "❌ ") + text, ephemeral=True)
+        if not ok:
+            _delete_local_paths([relative])
+            if old_path:
+                city["bannerPath"] = old_path
+                city["banner_path"] = old_path
+        elif old_path and old_path != relative:
+            old_resolved = _resolve_project_path(old_path)
+            if old_resolved.is_file() and old_resolved != destination:
+                try:
+                    old_resolved.unlink()
+                except OSError:
+                    pass
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Баннер обновлён" if ok else "❌ Ошибка баннера",
+            description=text,
+            state=state,
+            city=city if ok else previous,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
 
 
 class CityEditDataModal(discord.ui.Modal):
@@ -1374,67 +2710,411 @@ class CityEditDataModal(discord.ui.Modal):
         city_id: str,
         mayor_id: int,
         *,
-        current_city: dict[str, Any] | None = None,
+        current_city: dict[str, Any],
     ) -> None:
         super().__init__(title="Координаты и данные города", timeout=600)
         self.bot = bot
         self.store = store
         self.city_id = city_id
         self.mayor_id = mayor_id
-        current = current_city or {}
         self.style_input = discord.ui.TextInput(
             label="Архитектурный стиль",
             max_length=300,
-            default=str(current.get("style", ""))[:300] or None,
+            default=str(current_city.get("style", ""))[:300],
         )
         self.overworld_input = discord.ui.TextInput(
             label="Координаты в Верхнем мире",
             max_length=100,
-            default=str(current.get("overworld_coords", ""))[:100] or None,
+            default=str(current_city.get("overworld_coords", ""))[:100],
         )
         self.nether_input = discord.ui.TextInput(
             label="Нижний мир и ветка метро",
             max_length=150,
-            default=str(current.get("nether_coords", ""))[:150] or None,
+            default=str(current_city.get("nether_coords", ""))[:150],
         )
-        deputy_id = int(current.get("deputy_id", 0) or 0)
-        self.deputy_input = discord.ui.TextInput(
-            label="Discord заместителя",
-            placeholder="Упоминание или цифровой ID",
-            max_length=64,
-            default=(f"<@{deputy_id}>" if deputy_id else None),
-        )
-        for item in (self.style_input, self.overworld_input, self.nether_input, self.deputy_input):
-            self.add_item(item)
+        self.add_item(self.style_input)
+        self.add_item(self.overworld_input)
+        self.add_item(self.nether_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         state, city = await _management_guard(interaction, self.store, self.city_id, self.mayor_id)
-        if state is None or city is None or interaction.guild is None:
-            return
-        deputy_id = _discord_id(str(self.deputy_input))
-        if deputy_id is None:
-            await interaction.response.send_message("❌ Укажите упоминание или цифровой Discord ID заместителя.", ephemeral=True)
-            return
-        if deputy_id == self.mayor_id:
-            await interaction.response.send_message("❌ Мэр не может быть собственным заместителем.", ephemeral=True)
-            return
-        deputy = await _member(interaction.guild, deputy_id)
-        if deputy is None or deputy.bot:
-            await interaction.response.send_message("❌ Заместитель должен быть участником сервера и не может быть ботом.", ephemeral=True)
+        if state is None or city is None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with _lock(state.guild_id, self.city_id):
             previous = copy.deepcopy(city)
-            city.update(
-                {
-                    "style": str(self.style_input).strip(),
-                    "overworld_coords": str(self.overworld_input).strip(),
-                    "nether_coords": str(self.nether_input).strip(),
-                    "deputy_id": deputy_id,
-                }
-            )
+            city["style"] = str(self.style_input).strip()
+            city["overworld_coords"] = str(self.overworld_input).strip()
+            city["nether_coords"] = str(self.nether_input).strip()
             ok, text = await _save_and_sync(interaction, self.bot, self.store, state, self.city_id, city, previous)
-        await interaction.followup.send(("✅ " if ok else "❌ ") + text, ephemeral=True)
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Данные изменены" if ok else "❌ Ошибка изменения",
+            description=text,
+            state=state,
+            city=city if ok else previous,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
+
+
+async def _send_leadership_service_message(
+    bot: commands.Bot,
+    state: UnifiedState,
+    city_id: str,
+    city: dict[str, Any],
+    *,
+    leader_type: str,
+    old_id: int,
+    new_id: int,
+    moderator_id: int,
+) -> None:
+    thread = await _thread_channel(bot, _get_message_id(city, "registryThreadId", "registry_thread_id"))
+    if thread is None:
+        return
+    label = "мэра" if leader_type == "mayor" else "заместителя мэра"
+    embed = _simple_embed(
+        "🔄 Изменение руководства города",
+        (
+            f"Администрация изменила {label} города **{city.get('name', city_id)}**.\n\n"
+            f"**Предыдущий руководитель:** <@{old_id}> (`{old_id}`)\n"
+            f"**Новый руководитель:** <@{new_id}> (`{new_id}`)\n"
+            f"**Изменение выполнил:** <@{moderator_id}> (`{moderator_id}`)"
+        ),
+        color=0x5865F2,
+        footer=f"FunFernus • {city_id} • Служебное сообщение",
+    )
+    try:
+        await _send_channel_card(thread, kind="leadership", embed=embed, state=state, city=city)
+    except discord.HTTPException:
+        log.exception("Не удалось отправить служебное сообщение о руководстве %s", city_id)
+
+
+async def _replace_city_leader(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    interaction: discord.Interaction,
+    state: UnifiedState,
+    city_id: str,
+    city: dict[str, Any],
+    *,
+    leader_type: str,
+    new_member: discord.Member,
+) -> tuple[bool, str]:
+    guild = interaction.guild
+    if guild is None:
+        return False, "Сервер недоступен."
+    if new_member.bot:
+        return False, "Руководителем нельзя назначить бота."
+    old_mayor = _mayor_id(city)
+    old_deputy = _deputy_id(city)
+    old_id = old_mayor if leader_type == "mayor" else old_deputy
+    if new_member.id == old_id:
+        return False, "Этот пользователь уже занимает выбранную должность."
+    if leader_type == "mayor" and new_member.id == old_deputy:
+        return False, "Заместитель не может одновременно стать мэром без отдельной замены заместителя."
+    if leader_type == "deputy" and new_member.id == old_mayor:
+        return False, "Мэр и заместитель не могут быть одним человеком."
+    if leader_type == "mayor" and _has_active_city(state, new_member.id, exclude=city_id):
+        return False, "У нового мэра уже есть другой активный город или заявка."
+
+    previous = copy.deepcopy(city)
+    new_mayor = new_member.id if leader_type == "mayor" else old_mayor
+    new_deputy = new_member.id if leader_type == "deputy" else old_deputy
+    _set_leaders(city, new_mayor, new_deputy)
+    city[f"{leader_type}Present"] = True
+    city[f"{leader_type}_present"] = True
+    city[f"{leader_type}ChangedAt"] = _now_iso()
+    city[f"{leader_type}_changed_at"] = city[f"{leader_type}ChangedAt"]
+    history = city.setdefault("leadershipHistory", city.get("leadership_history", []))
+    history.append(
+        {
+            "type": leader_type,
+            "oldId": old_id,
+            "newId": new_member.id,
+            "moderatorId": interaction.user.id,
+            "changedAt": _now_iso(),
+        }
+    )
+    city["leadership_history"] = history
+    _refresh_allowed_writers(
+        guild,
+        state,
+        city,
+        getattr(bot, "admin_user_ids", set()),
+        bot.user.id if bot.user else 0,
+    )
+
+    mayor_role: discord.Role | None = None
+    old_mayor_member: discord.Member | None = None
+    if leader_type == "mayor":
+        role_ids = state.roles.get("city_mayor", [])
+        mayor_role = guild.get_role(role_ids[0]) if role_ids else None
+        if mayor_role is None:
+            state.cities[city_id] = previous
+            return False, "Роль мэра не настроена или удалена."
+        old_mayor_member = await _member(guild, old_id)
+        try:
+            if mayor_role not in new_member.roles:
+                await new_member.add_roles(mayor_role, reason=f"Назначен мэром города {city_id}")
+            if old_mayor_member is not None and mayor_role in old_mayor_member.roles:
+                await old_mayor_member.remove_roles(mayor_role, reason=f"Снят с должности мэра города {city_id}")
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            state.cities[city_id] = previous
+            if mayor_role in new_member.roles:
+                try:
+                    await new_member.remove_roles(mayor_role, reason=f"Откат смены мэра {city_id}")
+                except discord.HTTPException:
+                    pass
+            if old_mayor_member is not None and mayor_role not in old_mayor_member.roles:
+                try:
+                    await old_mayor_member.add_roles(mayor_role, reason=f"Откат смены мэра {city_id}")
+                except discord.HTTPException:
+                    pass
+            return False, f"Не удалось изменить роль мэра: {exc}"
+
+    try:
+        await store.save(state)
+    except Exception as exc:
+        state.cities[city_id] = previous
+        if leader_type == "mayor" and mayor_role is not None:
+            try:
+                if mayor_role in new_member.roles:
+                    await new_member.remove_roles(mayor_role, reason=f"Откат смены мэра {city_id}")
+                if old_mayor_member is not None and mayor_role not in old_mayor_member.roles:
+                    await old_mayor_member.add_roles(mayor_role, reason=f"Откат смены мэра {city_id}")
+            except discord.HTTPException:
+                log.exception("Не удалось откатить роли после ошибки хранилища %s", city_id)
+        return False, f"Изменение не сохранено: {exc}"
+
+    sync_ok, sync_text = await sync_registry_post(bot, state, city_id, city)
+    await _edit_review_message(bot, state, city_id, city)
+    await _send_leadership_service_message(
+        bot,
+        state,
+        city_id,
+        city,
+        leader_type=leader_type,
+        old_id=old_id,
+        new_id=new_member.id,
+        moderator_id=interaction.user.id,
+    )
+    await _send_city_log(
+        bot,
+        state,
+        title="🔄 Изменено руководство города",
+        description=(
+            f"Должность: **{'Мэр' if leader_type == 'mayor' else 'Заместитель мэра'}**.\n"
+            f"Старый руководитель: <@{old_id}> (`{old_id}`).\n"
+            f"Новый руководитель: <@{new_member.id}> (`{new_member.id}`).\n"
+            f"Модератор: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+            f"Синхронизация публикации: {sync_text}"
+        ),
+        city_id=city_id,
+        city=city,
+        color=0x5865F2,
+    )
+    try:
+        await store.save(state)
+    except Exception:
+        log.exception("Не удалось сохранить статус после смены руководства %s", city_id)
+    if sync_ok:
+        return True, "Руководство изменено, список разрешённых авторов и публикация обновлены."
+    return True, f"Руководство изменено. ⚠️ {sync_text}"
+
+
+class LeadershipUserSelect(discord.ui.UserSelect):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        leader_type: str,
+        moderator_id: int,
+    ) -> None:
+        label = "нового мэра" if leader_type == "mayor" else "нового заместителя"
+        super().__init__(placeholder=f"Выберите {label}", min_values=1, max_values=1)
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.leader_type = leader_type
+        self.moderator_id = moderator_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or interaction.user.id != self.moderator_id:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Эта панель открыта другому модератору.",
+            )
+            return
+        state = self.store.get(interaction.guild.id)
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None or not _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        ):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Город не найден или права модерации были изменены.",
+                state=state,
+            )
+            return
+        selected = self.values[0]
+        member = await _member(interaction.guild, selected.id)
+        if member is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Пользователь не на сервере",
+                description="Выбранный Discord ID не принадлежит текущему участнику сервера.",
+                state=state,
+                city=city,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with _lock(interaction.guild.id, self.city_id):
+            ok, text = await _replace_city_leader(
+                self.bot,
+                self.store,
+                interaction,
+                state,
+                self.city_id,
+                city,
+                leader_type=self.leader_type,
+                new_member=member,
+            )
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Руководство изменено" if ok else "❌ Смена не выполнена",
+            description=text,
+            state=state,
+            city=city,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
+
+
+class LeadershipUserSelectView(discord.ui.View):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        leader_type: str,
+        moderator_id: int,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.add_item(LeadershipUserSelect(bot, store, city_id, leader_type, moderator_id))
+
+
+class CityLeadershipAdminView(discord.ui.View):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        moderator_id: int,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.moderator_id = moderator_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or interaction.user.id != self.moderator_id:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Эта административная панель открыта другому пользователю.",
+            )
+            return False
+        state = self.store.get(interaction.guild.id)
+        if state is None or not _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        ):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет прав модерации",
+                description="Ваш доступ к управлению руководством был отозван.",
+                state=state,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Сменить мэра", emoji="👑", style=discord.ButtonStyle.danger)
+    async def change_mayor(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        city = state.cities.get(self.city_id) if state else None
+        await _send_interaction_card(
+            interaction,
+            kind="leadership",
+            title="👑 Выберите нового мэра",
+            description="Проверка и назначение выполняются исключительно по Discord ID.",
+            state=state,
+            city=city,
+            view=LeadershipUserSelectView(self.bot, self.store, self.city_id, "mayor", interaction.user.id),
+        )
+
+    @discord.ui.button(label="Сменить заместителя", emoji="🛡️", style=discord.ButtonStyle.danger)
+    async def change_deputy(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        city = state.cities.get(self.city_id) if state else None
+        await _send_interaction_card(
+            interaction,
+            kind="leadership",
+            title="🛡️ Выберите нового заместителя",
+            description="Новый пользователь должен находиться на сервере и отличаться от мэра.",
+            state=state,
+            city=city,
+            view=LeadershipUserSelectView(self.bot, self.store, self.city_id, "deputy", interaction.user.id),
+        )
+
+    @discord.ui.button(label="Проверить публикацию", emoji="🔎", style=discord.ButtonStyle.secondary)
+    async def check_registry(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None:
+            return
+        thread = await _thread_channel(self.bot, _get_message_id(city, "registryThreadId", "registry_thread_id"))
+        if thread is None:
+            city["registryStatus"] = "deleted"
+            city["registry_status"] = "deleted"
+            city["registryDeletedAt"] = _now_iso()
+            city["registry_deleted_at"] = city["registryDeletedAt"]
+            await self.store.save(state)
+            text = "Публикация удалена или недоступна. Статус сохранён в JSON и показан в панели."
+            kind = "warning"
+        else:
+            city["registryStatus"] = "active"
+            city["registry_status"] = "active"
+            await self.store.save(state)
+            text = f"Публикация доступна: <#{thread.id}>."
+            kind = "notification"
+        await _send_interaction_card(
+            interaction,
+            kind=kind,
+            title="🔎 Проверка публикации",
+            description=text,
+            state=state,
+            city=city,
+            color=0x59B77A if thread else 0xF2B84B,
+        )
 
 
 async def publish_city_panels(
@@ -1443,127 +3123,151 @@ async def publish_city_panels(
     guild: discord.Guild,
     state: UnifiedState,
 ) -> tuple[bool, str]:
+    admin_ids = getattr(bot, "admin_user_ids", set())
+    await _migrate_legacy_city_assets(bot, store, guild, state)
+    await _audit_city_state(bot, store, guild, state, admin_ids)
+
     application_channel = await _text_channel(bot, state.channels.get("city_application", 0))
+    management_channel = await _text_channel(bot, state.channels.get("city_management", 0))
     review_channel = await _text_channel(bot, state.channels.get("city_review", 0))
     registry_channel = await _forum_channel(bot, state.channels.get("city_registry", 0))
-    management_channel = await _text_channel(bot, state.channels.get("city_management", 0))
-    role_ids = state.roles.get("city_mayor", [])
-    mayor_role = guild.get_role(role_ids[0]) if role_ids else None
-    if application_channel is None or review_channel is None or registry_channel is None or management_channel is None:
-        return False, "Выберите канал подачи, рассмотрения, форум реестра и канал управления."
-    selected_channels = {
-        application_channel.id,
-        review_channel.id,
-        registry_channel.id,
-        management_channel.id,
-    }
-    if len(selected_channels) != 4:
-        return False, "Для подачи, рассмотрения, реестра и управления выберите четыре разных канала."
-    if mayor_role is None:
-        return False, "Выберите роль мэра."
-    if mayor_role.is_default() or mayor_role.managed:
-        return False, "Роль мэра должна быть обычной отдельной ролью Discord."
-    bot_member = guild.me
-    if bot_member is not None and mayor_role >= bot_member.top_role:
-        return False, "Переместите роль бота выше роли мэра, иначе бот не сможет её выдавать."
+    logs_channel = await _text_channel(bot, state.channels.get("city_logs", 0))
+    missing: list[str] = []
+    if application_channel is None:
+        missing.append("канал подачи")
+    if review_channel is None:
+        missing.append("канал рассмотрения")
+    if registry_channel is None:
+        missing.append("форум реестра")
+    if management_channel is None:
+        missing.append("канал управления")
+    if logs_channel is None:
+        missing.append("канал логов")
+    if missing:
+        return False, "Не настроены или удалены: " + ", ".join(missing) + "."
+    if not state.roles.get("city_mayor"):
+        return False, "Не выбрана роль мэра."
 
-    application_asset = state.asset("city_application_panel")
-    if not application_asset.url:
-        return False, "Сначала загрузите большой баннер панели регистрации городов."
-
-    accent = int(state.options.get("accent_color", 0x19B9D1))
     application_embed = discord.Embed(
-        title=state.texts.get("city_application_title", "Регистрация города FunFernus"),
-        description=state.texts.get(
-            "city_application_description",
-            "Нажмите кнопку ниже, выберите руководство и заполните данные будущего города.",
+        title=str(state.texts.get("city_application_title", "Регистрация города FunFernus")),
+        description=str(
+            state.texts.get(
+                "city_application_description",
+                "Нажмите кнопку ниже, выберите мэра и заместителя, затем заполните данные города.",
+            )
         ),
-        color=accent,
+        color=int(state.options.get("accent_color", 0x19B9D1)),
+        timestamp=datetime.now(timezone.utc),
     )
     application_embed.add_field(
-        name="Что потребуется",
+        name="Как проходит регистрация",
         value=(
-            "• название города до 20 символов\n"
-            "• мэр и заместитель\n"
-            "• архитектурный стиль и описание\n"
-            "• координаты Верхнего и Нижнего мира\n"
-            "• скриншоты первых построек"
+            "1. Выбор мэра и заместителя через Discord User Select.\n"
+            "2. Заполнение названия, стиля, координат и описания.\n"
+            "3. Загрузка настоящих файлов скриншотов.\n"
+            "4. Рассмотрение администрацией и публикация в реестре."
         ),
         inline=False,
     )
-    application_embed.set_footer(text=state.texts.get("city_application_footer", "FunFernus • Реестр городов"))
-    application_embed.set_image(url=application_asset.url)
-
-    application_view = CityApplicationPanelView(bot, store)
-    old_application = state.messages.get("city_application", 0)
-    application_message: discord.Message | None = None
-    try:
-        if old_application:
-            try:
-                application_message = await application_channel.fetch_message(old_application)
-                await application_message.edit(content=None, embed=application_embed, attachments=[], view=application_view)
-            except discord.HTTPException:
-                application_message = None
-        if application_message is None:
-            application_message = await application_channel.send(embed=application_embed, view=application_view)
-    except discord.Forbidden:
-        return False, "Боту не хватает прав для публикации панели регистрации."
-    except discord.HTTPException as exc:
-        return False, f"Discord не опубликовал панель регистрации: {exc}"
-    state.messages["city_application"] = application_message.id
-    try:
-        await store.save(state)
-    except Exception as exc:
-        return False, f"Панель опубликована, но её ID не удалось сохранить: {exc}"
+    application_embed.set_footer(text=str(state.texts.get("city_application_footer", "FunFernus • Реестр городов")))
 
     management_embed = discord.Embed(
         title="⚙️ Управление зарегистрированным городом",
         description=(
-            "Бот определит ваш Discord ID, найдёт связанный город и откроет личную панель мэра. "
-            "Все изменения сразу появятся в публичном реестре."
+            "Бот определяет город по вашему Discord ID. Через панель можно менять название, описание, "
+            "локальный главный баннер, координаты и архитектурный стиль."
         ),
-        color=accent,
+        color=int(state.options.get("accent_color", 0x19B9D1)),
+        timestamp=datetime.now(timezone.utc),
     )
     management_embed.add_field(
-        name="Доступные действия",
-        value="Изменение названия, описания, главного баннера, координат, стиля, метро и заместителя.",
+        name="Безопасность",
+        value=(
+            "Права не зависят от ника. Смена мэра и заместителя выполняется только настроенной администрацией. "
+            "Все изменения и ошибки записываются в отдельный канал логов."
+        ),
         inline=False,
     )
-    management_embed.set_footer(text=f"FunFernus • Доступ для роли {mayor_role.name}")
-    management_view = CityManagementLauncherView(bot, store)
-    old_management = state.messages.get("city_management", 0)
-    management_message: discord.Message | None = None
-    try:
-        if old_management:
+    management_embed.set_footer(text="FunFernus • Управление городом")
+
+    async def upsert(
+        channel: discord.TextChannel,
+        key: str,
+        *,
+        kind: str,
+        embed: discord.Embed,
+        view: discord.ui.View,
+    ) -> discord.Message:
+        message_id = int(state.messages.get(key, 0) or 0)
+        if message_id:
             try:
-                management_message = await management_channel.fetch_message(old_management)
-                await management_message.edit(content=None, embed=management_embed, attachments=[], view=management_view)
-            except discord.HTTPException:
-                management_message = None
-        if management_message is None:
-            management_message = await management_channel.send(embed=management_embed, view=management_view)
-    except discord.Forbidden:
-        return False, "Боту не хватает прав для публикации панели управления городом."
-    except discord.HTTPException as exc:
-        return False, f"Discord не опубликовал панель управления: {exc}"
+                message = await channel.fetch_message(message_id)
+                return await _edit_message_card(
+                    message,
+                    kind=kind,
+                    embed=embed,
+                    state=state,
+                    view=view,
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        return await _send_channel_card(channel, kind=kind, embed=embed, state=state, view=view)
+
+    try:
+        application_message = await upsert(
+            application_channel,
+            "city_application",
+            kind="application",
+            embed=application_embed,
+            view=CityApplicationPanelView(bot, store),
+        )
+        management_message = await upsert(
+            management_channel,
+            "city_management",
+            kind="management",
+            embed=management_embed,
+            view=CityManagementLauncherView(bot, store),
+        )
+    except Exception as exc:
+        await _send_city_log(
+            bot,
+            state,
+            title="❌ Ошибка публикации панелей городов",
+            description=f"Discord вернул ошибку: `{exc}`",
+            color=0xD85C5C,
+        )
+        return False, f"Discord не опубликовал панели: {exc}"
+
+    state.messages["city_application"] = application_message.id
     state.messages["city_management"] = management_message.id
     try:
         await store.save(state)
     except Exception as exc:
-        return False, f"Панели опубликованы, но ID панели управления не удалось сохранить: {exc}"
-    return True, "Панель регистрации и панель управления опубликованы."
+        return False, f"Панели отправлены, но их ID не сохранены: {exc}"
+
+    await _send_city_log(
+        bot,
+        state,
+        title="🚀 Панели системы городов опубликованы",
+        description=(
+            f"Панель заявок: <#{application_channel.id}> (`{application_message.id}`).\n"
+            f"Панель управления: <#{management_channel.id}> (`{management_message.id}`)."
+        ),
+        color=0x59B77A,
+    )
+    return True, "Панели регистрации и управления городами опубликованы с локальными полноразмерными баннерами."
 
 
 class CityPanelBannerModal(discord.ui.Modal):
     def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
-        super().__init__(title="Баннер регистрации городов", timeout=600)
+        super().__init__(title="Баннер панели регистрации городов", timeout=600)
         self.bot = bot
         self.store = store
         self.file_label = discord.ui.Label(
-            text="Файл большого баннера",
-            description="PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1600×600.",
+            text="Большой локальный баннер",
+            description="PNG/JPG/WEBP/GIF до 10 МБ. Файл сохранится в assets/banners/cities/.",
             component=discord.ui.FileUpload(
-                custom_id="city_application_panel_banner",
+                custom_id="city_panel_banner_file",
                 required=True,
                 min_values=1,
                 max_values=1,
@@ -1572,32 +3276,75 @@ class CityPanelBannerModal(discord.ui.Modal):
         self.add_item(self.file_label)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not _is_admin(interaction, getattr(self.bot, "admin_user_ids", set())):
-            await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        if state is None or not _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        ):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Изменять баннер системы городов может только администрация.",
+                state=state,
+            )
             return
         component = self.file_label.component
-        attachment = component.values[0] if isinstance(component, discord.ui.FileUpload) and component.values else None
-        if attachment is None:
-            await interaction.response.send_message("❌ Файл не выбран.", ephemeral=True)
+        attachments = list(component.values) if isinstance(component, discord.ui.FileUpload) else []
+        if not attachments:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Файл не выбран",
+                description="Прикрепите большой баннер.",
+                state=state,
+            )
+            return
+        attachment = attachments[0]
+        try:
+            _validate_attachment(attachment)
+        except ValueError as exc:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Некорректный файл",
+                description=str(exc),
+                state=state,
+            )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        state = self.store.get(interaction.guild.id)
-        if state is None:
-            await interaction.followup.send("❌ Хранилище не загружено.", ephemeral=True)
-            return
+        suffix = _safe_extension(attachment.filename, attachment.content_type or "")
+        destination = STATIC_BANNER_DIR / f"custom_application{suffix}"
+        previous = str(state.options.get("city_application_banner_path", "") or "")
         try:
-            await self.store.replace_asset(
-                interaction.guild,
-                state,
-                "city_application_panel",
-                attachment,
-                "Панель регистрации городов",
-            )
+            relative = await _save_attachment_local(attachment, destination)
+            state.options["city_application_banner_path"] = relative
+            await self.store.save(state)
         except Exception as exc:
-            await interaction.followup.send(f"❌ Не удалось сохранить баннер: `{exc}`", ephemeral=True)
+            state.options["city_application_banner_path"] = previous
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Баннер не сохранён",
+                description=f"Ошибка локального сохранения: `{exc}`",
+                state=state,
+                followup=True,
+            )
             return
         ok, text = await publish_city_panels(self.bot, self.store, interaction.guild, state)
-        await interaction.followup.send(("✅ " if ok else "⚠️ ") + text, ephemeral=True)
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Баннер установлен" if ok else "⚠️ Баннер сохранён",
+            description=text,
+            state=state,
+            followup=True,
+            color=0x59B77A if ok else 0xF2B84B,
+        )
 
 
 class CityChannelSelect(discord.ui.ChannelSelect):
@@ -1616,11 +3363,23 @@ class CityChannelSelect(discord.ui.ChannelSelect):
             return
         state = self.store.get(interaction.guild.id)
         if state is None:
-            await interaction.response.send_message("❌ Хранилище не загружено.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Хранилище недоступно",
+                description="Перезапустите панель настройки.",
+            )
             return
         state.channels[self.key] = self.values[0].id
         await self.store.save(state)
-        await interaction.response.send_message(f"✅ Выбран канал: {self.values[0].mention}", ephemeral=True)
+        await _send_interaction_card(
+            interaction,
+            kind="notification",
+            title="✅ Канал сохранён",
+            description=f"Выбран канал {self.values[0].mention} (`{self.values[0].id}`).",
+            state=state,
+            color=0x59B77A,
+        )
 
 
 class CityMayorRoleSelect(discord.ui.RoleSelect):
@@ -1633,19 +3392,124 @@ class CityMayorRoleSelect(discord.ui.RoleSelect):
             return
         state = self.store.get(interaction.guild.id)
         if state is None:
-            await interaction.response.send_message("❌ Хранилище не загружено.", ephemeral=True)
             return
         role = self.values[0]
         if role.is_default() or role.managed:
-            await interaction.response.send_message("❌ Выберите обычную отдельную роль, а не @everyone или интеграционную роль.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Неподходящая роль",
+                description="Выберите обычную отдельную роль, а не @everyone или роль интеграции.",
+                state=state,
+            )
             return
         bot_member = interaction.guild.me
         if bot_member is not None and role >= bot_member.top_role:
-            await interaction.response.send_message("❌ Роль бота должна находиться выше роли мэра.", ephemeral=True)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Неверная иерархия ролей",
+                description="Роль бота должна находиться выше роли мэра.",
+                state=state,
+            )
             return
         state.roles["city_mayor"] = [role.id]
         await self.store.save(state)
-        await interaction.response.send_message(f"✅ Роль мэра: {role.mention}", ephemeral=True)
+        await _send_interaction_card(
+            interaction,
+            kind="notification",
+            title="✅ Роль мэра сохранена",
+            description=f"После одобрения будет выдаваться роль {role.mention} (`{role.id}`).",
+            state=state,
+            color=0x59B77A,
+        )
+
+
+class CityStaffRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
+        super().__init__(placeholder="Выберите роли администраторов и модераторов", min_values=1, max_values=10)
+        self.bot = bot
+        self.store = store
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        if state is None:
+            return
+        roles = [role for role in self.values if not role.is_default() and not role.managed]
+        if not roles:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Роли не выбраны",
+                description="Выберите хотя бы одну обычную роль администрации.",
+                state=state,
+            )
+            return
+        state.roles["city_staff"] = [role.id for role in roles]
+        for city in state.cities.values():
+            _refresh_allowed_writers(
+                interaction.guild,
+                state,
+                city,
+                getattr(self.bot, "admin_user_ids", set()),
+                self.bot.user.id if self.bot.user else 0,
+            )
+        await self.store.save(state)
+        await _send_interaction_card(
+            interaction,
+            kind="notification",
+            title="✅ Роли модерации сохранены",
+            description="Выбраны: " + ", ".join(role.mention for role in roles),
+            state=state,
+            color=0x59B77A,
+        )
+
+
+class CityAllowedBotsSelect(discord.ui.UserSelect):
+    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
+        super().__init__(placeholder="Выберите разрешённых ботов", min_values=1, max_values=10)
+        self.bot = bot
+        self.store = store
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        if state is None:
+            return
+        members: list[discord.Member] = []
+        for selected in self.values:
+            member = await _member(interaction.guild, selected.id)
+            if member is None or not member.bot:
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ Выбран обычный пользователь",
+                    description="В этом меню разрешено выбирать только ботов. Сам FunFernus Bot разрешён автоматически.",
+                    state=state,
+                )
+                return
+            members.append(member)
+        state.options["city_allowed_bot_ids"] = [member.id for member in members]
+        for city in state.cities.values():
+            _refresh_allowed_writers(
+                interaction.guild,
+                state,
+                city,
+                getattr(self.bot, "admin_user_ids", set()),
+                self.bot.user.id if self.bot.user else 0,
+            )
+        await self.store.save(state)
+        await _send_interaction_card(
+            interaction,
+            kind="notification",
+            title="✅ Разрешённые боты сохранены",
+            description="Discord ID: " + ", ".join(f"`{member.id}`" for member in members),
+            state=state,
+            color=0x59B77A,
+        )
 
 
 class CitySetupView(discord.ui.View):
@@ -1654,6 +3518,23 @@ class CitySetupView(discord.ui.View):
         self.bot = bot
         self.store = store
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            return False
+        state = self.store.get(interaction.guild.id)
+        if state is None:
+            return False
+        if not _is_core_admin(interaction.user, interaction.guild, getattr(self.bot, "admin_user_ids", set())):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Настраивать систему городов могут владелец сервера и основные администраторы.",
+                state=state,
+            )
+            return False
+        return True
+
     @discord.ui.button(label="Каналы", emoji="📍", style=discord.ButtonStyle.secondary)
     async def channels(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         view = discord.ui.View(timeout=600)
@@ -1661,13 +3542,58 @@ class CitySetupView(discord.ui.View):
         view.add_item(CityChannelSelect(self.store, "city_review", "Канал рассмотрения заявок", discord.ChannelType.text))
         view.add_item(CityChannelSelect(self.store, "city_registry", "Форум реестра городов", discord.ChannelType.forum))
         view.add_item(CityChannelSelect(self.store, "city_management", "Канал управления городом", discord.ChannelType.text))
-        await interaction.response.send_message("Выберите четыре канала по очереди:", view=view, ephemeral=True)
+        view.add_item(CityChannelSelect(self.store, "city_logs", "Отдельный канал логов городов", discord.ChannelType.text))
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        await _send_interaction_card(
+            interaction,
+            kind="setup",
+            title="📍 Выбор каналов",
+            description="Последовательно выберите пять каналов системы городов.",
+            state=state,
+            view=view,
+        )
 
     @discord.ui.button(label="Роль Мэр", emoji="👑", style=discord.ButtonStyle.secondary)
     async def mayor_role(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         view = discord.ui.View(timeout=600)
         view.add_item(CityMayorRoleSelect(self.store))
-        await interaction.response.send_message("Выберите роль, которая выдаётся после одобрения города:", view=view, ephemeral=True)
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        await _send_interaction_card(
+            interaction,
+            kind="setup",
+            title="👑 Роль мэра",
+            description="Выберите роль, которая выдаётся принятому мэру.",
+            state=state,
+            view=view,
+        )
+
+    @discord.ui.button(label="Роли администрации", emoji="🛡️", style=discord.ButtonStyle.secondary)
+    async def staff_roles(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = discord.ui.View(timeout=600)
+        view.add_item(CityStaffRoleSelect(self.bot, self.store))
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        await _send_interaction_card(
+            interaction,
+            kind="setup",
+            title="🛡️ Роли модерации городов",
+            description="Эти роли смогут рассматривать заявки, менять руководство и писать во всех городских публикациях.",
+            state=state,
+            view=view,
+        )
+
+    @discord.ui.button(label="Разрешённые боты", emoji="🤖", style=discord.ButtonStyle.secondary)
+    async def allowed_bots(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = discord.ui.View(timeout=600)
+        view.add_item(CityAllowedBotsSelect(self.bot, self.store))
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        await _send_interaction_card(
+            interaction,
+            kind="setup",
+            title="🤖 Разрешённые боты",
+            description="Выберите ботов, сообщения которых не должны удаляться в публикациях городов.",
+            state=state,
+            view=view,
+        )
 
     @discord.ui.button(label="Большой баннер", emoji="🖼️", style=discord.ButtonStyle.primary)
     async def banner(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1680,10 +3606,485 @@ class CitySetupView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         state = self.store.get(interaction.guild.id)
         if state is None:
-            await interaction.followup.send("❌ Хранилище не загружено.", ephemeral=True)
             return
         ok, text = await publish_city_panels(self.bot, self.store, interaction.guild, state)
-        await interaction.followup.send(("✅ " if ok else "❌ ") + text, ephemeral=True)
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Панели опубликованы" if ok else "❌ Публикация не выполнена",
+            description=text,
+            state=state,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
+
+
+async def send_city_setup_message(
+    interaction: discord.Interaction,
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    *,
+    followup: bool = False,
+) -> None:
+    if interaction.guild is None:
+        return
+    state = store.get(interaction.guild.id) or await store.load_or_create(interaction.guild)
+    role_ids = state.roles.get("city_mayor", [])
+    staff_roles = state.roles.get("city_staff", [])
+    embed = discord.Embed(
+        title="⚙️ Настройка системы городов",
+        description=(
+            "Настройте пять каналов, роль мэра, роли администрации, разрешённых ботов и локальный баннер. "
+            "Все изображения системы городов отправляются настоящими файлами через `attachment://`, без внешних URL."
+        ),
+        color=int(state.options.get("accent_color", 0x19B9D1)),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Роль мэра", value=f"<@&{role_ids[0]}>" if role_ids else "Не выбрана", inline=False)
+    embed.add_field(
+        name="Роли администрации",
+        value=" ".join(f"<@&{role_id}>" for role_id in staff_roles) if staff_roles else "Не выбраны",
+        inline=False,
+    )
+    embed.add_field(
+        name="Канал логов",
+        value=f"<#{state.channels.get('city_logs', 0)}>" if state.channels.get("city_logs", 0) else "Не выбран",
+        inline=False,
+    )
+    embed.set_footer(text="FunFernus • Настройка городов")
+    embeds, file = _message_payload("setup", embed, state=state)
+    kwargs = {
+        "embeds": embeds,
+        "file": file,
+        "view": CitySetupView(bot, store),
+        "ephemeral": True,
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    if followup:
+        await interaction.followup.send(**kwargs)
+    else:
+        await interaction.response.send_message(**kwargs)
+
+
+async def _handle_city_question_dm(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    message: discord.Message,
+) -> bool:
+    if message.guild is not None or message.author.bot:
+        return False
+    if not message.content.strip() and not message.attachments:
+        return False
+
+    for state in list(store._states.values()):
+        target: tuple[str, dict[str, Any]] | None = None
+        for city_id, city in state.cities.items():
+            if city.get("status") == "pending" and _mayor_id(city) == message.author.id and city.get("active_question"):
+                target = (city_id, city)
+                break
+        if target is None:
+            continue
+        city_id, city = target
+        guild = bot.get_guild(state.guild_id)
+        if guild is None:
+            continue
+        async with _lock(state.guild_id, city_id):
+            city = state.cities.get(city_id)
+            if city is None or city.get("status") != "pending" or _mayor_id(city) != message.author.id or not city.get("active_question"):
+                continue
+            previous = copy.deepcopy(city)
+            active = city.get("active_question", {})
+            token = active.get("token")
+            saved_paths: list[str] = []
+            try:
+                question_folder = _city_upload_folder(state.guild_id, city_id) / "questions" / str(token or secrets.token_hex(4))
+                for index, attachment in enumerate(message.attachments[:MAX_SCREENSHOTS], 1):
+                    _validate_attachment(attachment)
+                    suffix = _safe_extension(attachment.filename, attachment.content_type or "")
+                    saved_paths.append(
+                        await _save_attachment_local(attachment, question_folder / f"answer_{index:02d}{suffix}")
+                    )
+            except Exception as exc:
+                _delete_local_paths(saved_paths)
+                try:
+                    embed = _simple_embed(
+                        "❌ Файлы ответа не сохранены",
+                        f"Проверьте формат и размер вложений, затем отправьте ответ повторно. Ошибка: `{exc}`",
+                        color=0xD85C5C,
+                    )
+                    await _send_user_card(message.author, kind="warning", embed=embed, state=state, city=city)
+                except discord.HTTPException:
+                    pass
+                return True
+
+            answer_text = message.content.strip() or "Ответ отправлен только файлами."
+            history_item: dict[str, Any] | None = None
+            for item in reversed(city.get("question_history", [])):
+                if item.get("token") == token:
+                    item["answer"] = answer_text
+                    item["answered_at"] = _now_iso()
+                    item["answerAttachmentPaths"] = saved_paths
+                    item["answer_attachment_paths"] = list(saved_paths)
+                    history_item = item
+                    break
+            city["active_question"] = {}
+            try:
+                await store.save(state)
+            except Exception:
+                state.cities[city_id] = previous
+                _delete_local_paths(saved_paths)
+                log.exception("Не удалось сохранить ответ мэра по заявке %s", city_id)
+                try:
+                    embed = _simple_embed(
+                        "❌ Ответ не сохранён",
+                        "Повторите отправку чуть позже.",
+                        color=0xD85C5C,
+                    )
+                    await _send_user_card(message.author, kind="warning", embed=embed, state=state, city=previous)
+                except discord.HTTPException:
+                    pass
+                return True
+
+            await _edit_review_message(bot, state, city_id, city)
+            review_channel = await _text_channel(bot, int(city.get("review_channel_id", 0)))
+            if review_channel is not None:
+                try:
+                    review_message = await review_channel.fetch_message(
+                        _get_message_id(city, "reviewMessageId", "review_message_id")
+                    )
+                    answer_embed = _simple_embed(
+                        f"💬 Ответ мэра • {city_id}",
+                        _trim(answer_text, 4000),
+                        color=0x5865F2,
+                        footer=f"FunFernus • {city_id} • Ответ на вопрос",
+                    )
+                    answer_embed.add_field(name="Мэр", value=f"<@{message.author.id}>\n`ID: {message.author.id}`", inline=False)
+                    answer_message = await _send_channel_card(
+                        review_channel,
+                        kind="moderation",
+                        embed=answer_embed,
+                        state=state,
+                        city=city,
+                        content=f"↪️ Ответ относится к заявке `{city_id}` и сообщению `{review_message.id}`.",
+                    )
+                    attachment_message: discord.Message | None = None
+                    files: list[discord.File] = []
+                    for index, path in enumerate(_existing_local_paths(saved_paths), 1):
+                        suffix = path.suffix.lower()
+                        files.append(discord.File(path, filename=f"answer_attachment_{index:02d}{suffix}"))
+                    if files:
+                        attachment_message = await review_channel.send(
+                            content=f"📎 **Вложения к ответу мэра по заявке `{city_id}`**",
+                            files=files,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    if history_item is not None:
+                        history_item["reviewAnswerMessageId"] = answer_message.id
+                        history_item["review_answer_message_id"] = answer_message.id
+                        history_item["reviewAnswerAttachmentsMessageId"] = attachment_message.id if attachment_message else 0
+                        history_item["review_answer_attachments_message_id"] = attachment_message.id if attachment_message else 0
+                        await store.save(state)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    log.exception("Не удалось переслать ответ мэра по %s", city_id)
+
+            await _send_city_log(
+                bot,
+                state,
+                title="💬 Получен ответ мэра",
+                description=(
+                    f"Мэр: <@{message.author.id}> (`{message.author.id}`).\n"
+                    f"Текст: {_trim(answer_text, 1500)}\n"
+                    f"Локальных вложений: **{len(saved_paths)}**."
+                ),
+                city_id=city_id,
+                city=city,
+            )
+            try:
+                confirmation = _simple_embed(
+                    "✅ Ответ передан администрации",
+                    f"Ваш ответ по заявке `{city_id}` сохранён. Вложения переданы отдельным сообщением без URL.",
+                    color=0x59B77A,
+                )
+                await _send_user_card(message.author, kind="notification", embed=confirmation, state=state, city=city)
+            except discord.HTTPException:
+                pass
+            return True
+    return False
+
+
+async def _handle_city_thread_message(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    message: discord.Message,
+) -> None:
+    if message.guild is None or not isinstance(message.channel, discord.Thread):
+        return
+    # Системные события Discord не модерируются и не удаляются.
+    if message.type is not discord.MessageType.default:
+        return
+    state = store.get(message.guild.id)
+    if state is None:
+        return
+    found = _find_city_by_thread(state, message.channel.id)
+    if found is None:
+        return
+    city_id, city = found
+    if city.get("status") != "approved":
+        return
+    if _can_write_city_thread(
+        message,
+        message.guild,
+        state,
+        city,
+        getattr(bot, "admin_user_ids", set()),
+        bot.user.id if bot.user else 0,
+    ):
+        return
+
+    deleted = False
+    try:
+        _bot_deleted_messages.add(message.id)
+        await message.delete()
+        deleted = True
+    except discord.NotFound:
+        deleted = True
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("Не удалось удалить запрещённое сообщение %s в городе %s", message.id, city_id)
+
+    content = message.content.strip() or "Сообщение без текста."
+    attachment_names = ", ".join(item.filename for item in message.attachments) or "нет"
+    await _send_city_log(
+        bot,
+        state,
+        title="🚫 Удалено сообщение постороннего пользователя",
+        description=(
+            f"Пользователь: <@{message.author.id}> (`{message.author.id}`).\n"
+            f"Город: **{city.get('name', city_id)}**.\n"
+            f"Публикация: <#{message.channel.id}> (`{message.channel.id}`).\n"
+            f"Время: <t:{int(datetime.now(timezone.utc).timestamp())}:F>.\n"
+            f"Удаление: {'успешно' if deleted else 'не выполнено'}.\n"
+            f"Содержимое: {_trim(content, 1200)}\n"
+            f"Вложения: {_trim(attachment_names, 500)}"
+        ),
+        city_id=city_id,
+        city=city,
+        color=0xD85C5C,
+    )
+
+    cooldown_key = (message.channel.id, message.author.id)
+    now = time.monotonic()
+    if now - _warning_cooldowns.get(cooldown_key, 0.0) < WARNING_COOLDOWN_SECONDS:
+        return
+    _warning_cooldowns[cooldown_key] = now
+    warning = _simple_embed(
+        "🚫 Сообщение удалено",
+        (
+            f"В публикации города **{city.get('name', city_id)}** могут писать только мэр, заместитель, "
+            "настроенная администрация и разрешённые боты. Проверка выполняется по Discord ID."
+        ),
+        color=0xD85C5C,
+        footer=f"FunFernus • {city_id}",
+    )
+    try:
+        await _send_user_card(message.author, kind="warning", embed=warning, state=state, city=city)
+    except discord.HTTPException:
+        try:
+            temporary = await _send_channel_card(
+                message.channel,
+                kind="warning",
+                embed=warning,
+                state=state,
+                city=city,
+            )
+            await temporary.delete(delay=8)
+        except discord.HTTPException:
+            pass
+
+
+async def _mark_registry_thread_deleted(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    guild_id: int,
+    thread_id: int,
+) -> None:
+    state = store.get(guild_id)
+    if state is None:
+        return
+    found = _find_city_by_thread(state, thread_id)
+    if found is None:
+        return
+    city_id, city = found
+    if city.get("registryStatus") == "deleted":
+        return
+    city["registryStatus"] = "deleted"
+    city["registry_status"] = "deleted"
+    city["registryDeletedAt"] = _now_iso()
+    city["registry_deleted_at"] = city["registryDeletedAt"]
+    try:
+        await store.save(state)
+    except Exception:
+        log.exception("Не удалось сохранить удаление публикации города %s", city_id)
+    await _send_city_log(
+        bot,
+        state,
+        title="🗑️ Городская публикация удалена",
+        description=(
+            f"Публикация `{thread_id}` города **{city.get('name', city_id)}** больше не существует. "
+            "Система продолжает работать, а панель показывает статус удаления."
+        ),
+        city_id=city_id,
+        city=city,
+        color=0xD85C5C,
+    )
+
+
+async def _handle_raw_city_message_delete(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    payload: Any,
+) -> None:
+    message_id = int(getattr(payload, "message_id", 0) or 0)
+    guild_id = int(getattr(payload, "guild_id", 0) or 0)
+    if not message_id or not guild_id:
+        return
+    if message_id in _bot_deleted_messages:
+        _bot_deleted_messages.discard(message_id)
+        return
+    state = store.get(guild_id)
+    if state is None:
+        return
+    changes: list[tuple[str, dict[str, Any], str]] = []
+    for city_id, city in state.cities.items():
+        if message_id == _get_message_id(city, "registryMessageId", "registry_message_id"):
+            city["registryStatus"] = "message_deleted"
+            city["registry_status"] = "message_deleted"
+            changes.append((city_id, city, "основная карточка реестра"))
+        elif message_id == _get_message_id(city, "registryScreenshotsMessageId", "registry_screenshots_message_id"):
+            city["registryStatus"] = "screenshots_deleted"
+            city["registry_status"] = "screenshots_deleted"
+            changes.append((city_id, city, "сообщение со скриншотами реестра"))
+        elif message_id == _get_message_id(city, "reviewMessageId", "review_message_id"):
+            city["reviewMessageStatus"] = "deleted"
+            city["review_message_status"] = "deleted"
+            changes.append((city_id, city, "модерационная карточка"))
+        elif message_id == _get_message_id(city, "reviewScreenshotsMessageId", "review_screenshots_message_id"):
+            city["reviewScreenshotsStatus"] = "deleted"
+            city["review_screenshots_status"] = "deleted"
+            changes.append((city_id, city, "скриншоты заявки"))
+    if not changes:
+        return
+    try:
+        await store.save(state)
+    except Exception:
+        log.exception("Не удалось сохранить статус удалённого сообщения города")
+    for city_id, city, label in changes:
+        await _send_city_log(
+            bot,
+            state,
+            title="🗑️ Вручную удалено сообщение системы городов",
+            description=f"Удалено: **{label}**. ID сообщения: `{message_id}`.",
+            city_id=city_id,
+            city=city,
+            color=0xD85C5C,
+        )
+
+
+async def _handle_member_presence_change(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    member: discord.Member,
+    *,
+    present: bool,
+) -> None:
+    state = store.get(member.guild.id)
+    if state is None:
+        return
+    changed: list[tuple[str, dict[str, Any], str]] = []
+    for city_id, city in state.cities.items():
+        role = ""
+        if _mayor_id(city) == member.id:
+            role = "mayor"
+        elif _deputy_id(city) == member.id:
+            role = "deputy"
+        if not role:
+            continue
+        city[f"{role}Present"] = present
+        city[f"{role}_present"] = present
+        city[f"{role}{'JoinedAt' if present else 'LeftAt'}"] = _now_iso()
+        city[f"{role}_{'joined_at' if present else 'left_at'}"] = city[f"{role}{'JoinedAt' if present else 'LeftAt'}"]
+        changed.append((city_id, city, role))
+    if not changed:
+        return
+    try:
+        await store.save(state)
+    except Exception:
+        log.exception("Не удалось сохранить изменение присутствия руководителя")
+    for city_id, city, role in changed:
+        label = "мэр" if role == "mayor" else "заместитель мэра"
+        await _edit_review_message(bot, state, city_id, city)
+        if city.get("status") == "approved":
+            await sync_registry_post(bot, state, city_id, city)
+        await _send_city_log(
+            bot,
+            state,
+            title="👤 Руководитель вернулся на сервер" if present else "⚠️ Руководитель покинул сервер",
+            description=(
+                f"Пользователь <@{member.id}> (`{member.id}`), должность **{label}**, "
+                f"{'снова находится на сервере' if present else 'покинул Discord-сервер'}. "
+                + ("Доступ по ID снова действует." if present else "Администрации необходимо назначить нового руководителя.")
+            ),
+            city_id=city_id,
+            city=city,
+            color=0x59B77A if present else 0xF2B84B,
+        )
+
+
+async def _handle_city_staff_role_change(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    before: discord.Member,
+    after: discord.Member,
+) -> None:
+    if before.guild.id != after.guild.id or {role.id for role in before.roles} == {role.id for role in after.roles}:
+        return
+    state = store.get(after.guild.id)
+    if state is None:
+        return
+    admin_ids = getattr(bot, "admin_user_ids", set())
+    before_access = _is_city_staff_member(before, before.guild, state, admin_ids)
+    after_access = _is_city_staff_member(after, after.guild, state, admin_ids)
+    changed = False
+    for city in state.cities.values():
+        previous_ids = list(city.get("allowedWriterIds", []))
+        _refresh_allowed_writers(
+            after.guild,
+            state,
+            city,
+            admin_ids,
+            bot.user.id if bot.user else 0,
+        )
+        if previous_ids != city.get("allowedWriterIds", []):
+            changed = True
+    if changed:
+        try:
+            await store.save(state)
+        except Exception:
+            log.exception("Не удалось сохранить обновление ролей модерации городов")
+    if before_access != after_access:
+        await _send_city_log(
+            bot,
+            state,
+            title="🛡️ Изменён доступ к публикациям городов",
+            description=(
+                f"Пользователь <@{after.id}> (`{after.id}`) "
+                + (
+                    "получил право модерации и отправки сообщений во всех городских публикациях."
+                    if after_access
+                    else "потерял право модерации и отправки сообщений во всех городских публикациях."
+                )
+            ),
+            color=0x59B77A if after_access else 0xF2B84B,
+        )
 
 
 async def setup_cities(bot: commands.Bot, store: UnifiedDiscordStore, admin_ids: set[int]) -> None:
@@ -1694,96 +4095,112 @@ async def setup_cities(bot: commands.Bot, store: UnifiedDiscordStore, admin_ids:
     @bot.tree.command(name="настроить_города", description="Настроить регистрацию, реестр и управление городами")
     @app_commands.guild_only()
     async def cities_setup(interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not _is_admin(interaction, admin_ids):
-            await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+        if interaction.guild is None or not _is_core_admin(interaction.user, interaction.guild, admin_ids):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Команда доступна владельцу сервера и основным администраторам.",
+            )
+            return
+        await send_city_setup_message(interaction, bot, store)
+
+    @bot.tree.command(name="город_руководство", description="Открыть административную панель смены мэра и заместителя")
+    @app_commands.describe(city_id="ID города, например CITY-0001")
+    @app_commands.guild_only()
+    async def city_leadership(interaction: discord.Interaction, city_id: str) -> None:
+        if interaction.guild is None:
             return
         state = store.get(interaction.guild.id) or await store.load_or_create(interaction.guild)
-        role_ids = state.roles.get("city_mayor", [])
-        role_text = f"<@&{role_ids[0]}>" if role_ids else "не выбрана"
-        embed = discord.Embed(
-            title="⚙️ Настройка системы городов",
-            description=(
-                "Выберите канал подачи, закрытый канал рассмотрения, форум реестра, "
-                "канал управления и роль мэра. Затем загрузите большой баннер и опубликуйте панели."
-            ),
-            color=int(state.options.get("accent_color", 0x19B9D1)),
+        if not _is_city_staff_member(interaction.user, interaction.guild, state, admin_ids):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Менять руководство могут только настроенные администраторы и модераторы.",
+                state=state,
+            )
+            return
+        normalized_id = city_id.strip().upper()
+        city = state.cities.get(normalized_id)
+        if city is None or city.get("status") != "approved":
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Город не найден",
+                description="Укажите ID принятого города в формате `CITY-0001`.",
+                state=state,
+            )
+            return
+        embed = city_management_embed(normalized_id, city, state)
+        embed.title = f"🛡️ Административное управление • {city.get('name', normalized_id)}"
+        embed.description = (
+            "Выберите, кого заменить. После смены старый руководитель сразу потеряет право писать в публикации, "
+            "а новый получит его без перезапуска бота."
         )
-        embed.add_field(name="Роль мэра", value=role_text, inline=False)
-        await interaction.response.send_message(embed=embed, view=CitySetupView(bot, store), ephemeral=True)
+        embeds, file = _message_payload("leadership", embed, city=city, state=state)
+        await interaction.response.send_message(
+            embeds=embeds,
+            file=file,
+            view=CityLeadershipAdminView(bot, store, normalized_id, interaction.user.id),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @bot.listen("on_message")
-    async def city_question_dm_listener(message: discord.Message) -> None:
-        if message.author.bot or message.guild is not None:
+    async def city_message_listener(message: discord.Message) -> None:
+        if await _handle_city_question_dm(bot, store, message):
             return
-        parts: list[str] = []
-        if message.content.strip():
-            parts.append(message.content.strip())
-        parts.extend(f"[{attachment.filename}]({attachment.url})" for attachment in message.attachments)
-        if not parts:
-            return
-        answer = "\n".join(parts)
+        await _handle_city_thread_message(bot, store, message)
 
-        for state in list(store._states.values()):
-            target: tuple[str, dict[str, Any]] | None = None
-            for city_id, city in state.cities.items():
-                if city.get("status") != "pending" or int(city.get("mayor_id", 0)) != message.author.id:
-                    continue
-                if city.get("active_question"):
-                    target = (city_id, city)
-                    break
-            if target is None:
-                continue
-            city_id, city = target
-            async with _lock(state.guild_id, city_id):
-                city = state.cities.get(city_id)
-                if (
-                    city is None
-                    or city.get("status") != "pending"
-                    or int(city.get("mayor_id", 0)) != message.author.id
-                    or not city.get("active_question")
-                ):
-                    continue
-                previous = copy.deepcopy(city)
-                active = city.get("active_question", {})
-                token = active.get("token")
-                for item in reversed(city.get("question_history", [])):
-                    if item.get("token") == token:
-                        item["answer"] = answer
-                        item["answered_at"] = datetime.now(timezone.utc).isoformat()
-                        break
-                city["active_question"] = {}
-                try:
-                    await store.save(state)
-                except Exception:
-                    state.cities[city_id] = previous
-                    log.exception("Не удалось сохранить ответ мэра по заявке %s", city_id)
-                    try:
-                        await message.reply("❌ Ответ не удалось сохранить. Повторите отправку чуть позже.")
-                    except discord.HTTPException:
-                        pass
-                    return
-                await _edit_review_message(bot, state, city_id, city)
+    @bot.listen("on_raw_message_delete")
+    async def city_raw_message_delete_listener(payload: Any) -> None:
+        await _handle_raw_city_message_delete(bot, store, payload)
 
-                review_channel = await _text_channel(bot, int(city.get("review_channel_id", 0)))
-                if review_channel is not None:
-                    try:
-                        review_message = await review_channel.fetch_message(int(city.get("review_message_id", 0)))
-                        embed = discord.Embed(
-                            title=f"💬 Ответ мэра • {city_id}",
-                            description=_trim(answer, 4000),
-                            color=0x5865F2,
-                            timestamp=datetime.now(timezone.utc),
-                        )
-                        embed.add_field(name="Мэр", value=f"<@{message.author.id}>", inline=False)
-                        await review_message.reply(
-                            embed=embed,
-                            mention_author=False,
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                    except discord.HTTPException:
-                        log.exception("Не удалось переслать ответ мэра по %s", city_id)
-            try:
-                await message.reply(f"✅ Ответ по заявке `{city_id}` передан администрации.")
-            except discord.HTTPException:
-                pass
+    @bot.listen("on_raw_thread_delete")
+    async def city_raw_thread_delete_listener(payload: Any) -> None:
+        guild_id = int(getattr(payload, "guild_id", 0) or 0)
+        thread_id = int(getattr(payload, "thread_id", 0) or 0)
+        if guild_id and thread_id:
+            await _mark_registry_thread_deleted(bot, store, guild_id, thread_id)
+
+    @bot.listen("on_thread_delete")
+    async def city_thread_delete_listener(thread: discord.Thread) -> None:
+        await _mark_registry_thread_deleted(bot, store, thread.guild.id, thread.id)
+
+    @bot.listen("on_member_remove")
+    async def city_member_remove_listener(member: discord.Member) -> None:
+        await _handle_member_presence_change(bot, store, member, present=False)
+
+    @bot.listen("on_member_join")
+    async def city_member_join_listener(member: discord.Member) -> None:
+        await _handle_member_presence_change(bot, store, member, present=True)
+
+    @bot.listen("on_member_update")
+    async def city_member_update_listener(before: discord.Member, after: discord.Member) -> None:
+        await _handle_city_staff_role_change(bot, store, before, after)
+
+    @bot.listen("on_guild_channel_delete")
+    async def city_channel_delete_listener(channel: discord.abc.GuildChannel) -> None:
+        state = store.get(channel.guild.id)
+        if state is None:
             return
+        keys = [key for key, value in state.channels.items() if key.startswith("city_") and int(value or 0) == channel.id]
+        if not keys:
+            return
+        state.options.setdefault("city_deleted_channels", {})[str(channel.id)] = {
+            "keys": keys,
+            "name": channel.name,
+            "deletedAt": _now_iso(),
+        }
+        try:
+            await store.save(state)
+        except Exception:
+            log.exception("Не удалось сохранить удаление канала системы городов")
+        await _send_city_log(
+            bot,
+            state,
+            title="🗑️ Удалён канал системы городов",
+            description=f"Канал **{channel.name}** (`{channel.id}`), назначения: {', '.join(keys)}.",
+            color=0xD85C5C,
+        )

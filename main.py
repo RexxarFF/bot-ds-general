@@ -31,7 +31,7 @@ from modules.government import (
 from modules.cities import (
     setup_cities,
     publish_city_panels,
-    CitySetupView,
+    send_city_setup_message,
 )
 
 
@@ -2099,16 +2099,10 @@ class UnifiedSetupView(discord.ui.View):
     async def cities(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.guild is None:
             return
-        state = self.bot.unified_store.get(interaction.guild.id) or await self.bot.unified_store.load_or_create(interaction.guild)
-        embed = discord.Embed(
-            title="⚙️ Настройка системы городов",
-            description="Регистрация, модерация, форум-реестр, роль мэра и синхронное управление карточками.",
-            color=int(state.options.get("accent_color", 0x19B9D1)),
-        )
-        await interaction.response.send_message(
-            embed=embed,
-            view=CitySetupView(self.bot, self.bot.unified_store),
-            ephemeral=True,
+        await send_city_setup_message(
+            interaction,
+            self.bot,
+            self.bot.unified_store,
         )
 
 
@@ -2213,7 +2207,16 @@ async def on_ready() -> None:
                 await publish_support_panel(bot, bot.unified_store, guild, unified_state)
             if unified_state.channels.get("government_panel") and unified_state.channels.get("government_review"):
                 await publish_government_panel(bot, bot.unified_store, guild, unified_state)
-            if unified_state.channels.get("city_application") and unified_state.channels.get("city_management"):
+            city_channel_keys = (
+                "city_application",
+                "city_review",
+                "city_registry",
+                "city_management",
+                "city_logs",
+            )
+            if unified_state.cities or any(unified_state.channels.get(key) for key in city_channel_keys):
+                # publish_city_panels также выполняет безопасный аудит старых данных:
+                # проверяет руководителей, публикации и локальные файлы после перезапуска.
                 await publish_city_panels(bot, bot.unified_store, guild, unified_state)
         except Exception:
             log.exception("Не удалось загрузить объединённое хранилище для сервера %s", guild.id)
