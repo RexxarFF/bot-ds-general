@@ -45,6 +45,7 @@ STATIC_BANNERS: dict[str, str] = {
 }
 
 _city_locks: dict[tuple[int, str], asyncio.Lock] = {}
+_panel_publish_locks: dict[int, asyncio.Lock] = {}
 _warning_cooldowns: dict[tuple[int, int], float] = {}
 _bot_deleted_messages: set[int] = set()
 _missing_asset_log_cache: set[tuple[int, str, str]] = set()
@@ -52,6 +53,13 @@ _missing_asset_log_cache: set[tuple[int, str, str]] = set()
 
 def _lock(guild_id: int, city_id: str) -> asyncio.Lock:
     return _city_locks.setdefault((guild_id, city_id), asyncio.Lock())
+
+
+def _panel_publish_lock(guild_id: int) -> asyncio.Lock:
+    # Сериализует публикацию панелей одного сервера. Это не даёт двум
+    # одновременным кликам отправлять несколько PATCH-запросов к одним и тем
+    # же сообщениям и заметно снижает вероятность Discord rate limit (429).
+    return _panel_publish_locks.setdefault(guild_id, asyncio.Lock())
 
 
 def _now_iso() -> str:
@@ -383,37 +391,90 @@ async def _send_interaction_card(
     description: str,
     state: UnifiedState | None = None,
     city: dict[str, Any] | None = None,
-    view: discord.ui.View | None = None,
+    view: discord.ui.View | discord.ui.LayoutView | None = None,
     ephemeral: bool = True,
     followup: bool = False,
     color: int | None = None,
 ) -> None:
     accent = color if color is not None else int((state.options if state else {}).get("accent_color", 0x19B9D1))
     content = _simple_embed(title, description, color=accent)
-    embeds, file = _message_payload(kind, content, city=city, state=state)
-    kwargs = {
-        "embeds": embeds,
-        "file": file,
-        "view": view,
-        "ephemeral": ephemeral,
-        "allowed_mentions": discord.AllowedMentions.none(),
-    }
+
+    def build_send_kwargs() -> dict[str, Any]:
+        embeds, banner_file = _message_payload(kind, content, city=city, state=state)
+        result: dict[str, Any] = {
+            "embeds": embeds,
+            "file": banner_file,
+            "ephemeral": ephemeral,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        # discord.py 2.7 не принимает явное view=None в send_message/followup.send.
+        # Параметр необходимо полностью убрать из вызова, когда компонентов нет.
+        if view is not None:
+            result["view"] = view
+        return result
+
     if followup:
-        # После defer(thinking=True) необходимо редактировать исходный ответ.
-        # Обычный followup создавал новое сообщение, а индикатор «бот думает»
-        # оставался висеть бесконечно, хотя панель уже была обновлена.
+        # После defer(thinking=True) завершаем именно исходный ответ. Иначе
+        # Discord продолжает показывать «бот думает», даже если панель обновлена.
+        embeds, banner_file = _message_payload(kind, content, city=city, state=state)
+        edit_kwargs: dict[str, Any] = {
+            "content": None,
+            "embeds": embeds,
+            "attachments": [banner_file],
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if view is not None:
+            edit_kwargs["view"] = view
         try:
-            await interaction.edit_original_response(
-                content=None,
-                embeds=embeds,
-                attachments=[file],
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except (discord.NotFound, discord.HTTPException):
-            await interaction.followup.send(**kwargs)
+            await interaction.edit_original_response(**edit_kwargs)
+            return
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            # Файл мог быть закрыт после неудачного edit, поэтому payload
+            # создаётся заново перед резервной отправкой followup-сообщения.
+            await interaction.followup.send(**build_send_kwargs())
+            return
+
+    send_kwargs = build_send_kwargs()
+    if interaction.response.is_done():
+        await interaction.followup.send(**send_kwargs)
     else:
-        await interaction.response.send_message(**kwargs)
+        await interaction.response.send_message(**send_kwargs)
+
+
+async def _notify_component_error(
+    interaction: discord.Interaction,
+    error: Exception,
+    *,
+    context: str,
+) -> None:
+    log.error(
+        "Ошибка Discord-компонента системы городов (%s): %s",
+        context,
+        error,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    text = "❌ Не удалось выполнить действие. Ошибка записана в лог. Повторите попытку один раз."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        log.exception("Не удалось показать пользователю уведомление об ошибке city-компонента")
+
+
+class CityTransientView(discord.ui.View):
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+    ) -> None:
+        await _notify_component_error(
+            interaction,
+            error,
+            context=f"{item.__class__.__name__}",
+        )
 
 
 async def _send_user_card(
@@ -435,17 +496,19 @@ async def _send_channel_card(
     embed: discord.Embed,
     state: UnifiedState,
     city: dict[str, Any] | None = None,
-    view: discord.ui.View | None = None,
+    view: discord.ui.View | discord.ui.LayoutView | None = None,
     content: str | None = None,
 ) -> discord.Message:
     embeds, file = _message_payload(kind, embed, city=city, state=state)
-    return await channel.send(
-        content=content,
-        embeds=embeds,
-        file=file,
-        view=view,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    kwargs: dict[str, Any] = {
+        "content": content,
+        "embeds": embeds,
+        "file": file,
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    if view is not None:
+        kwargs["view"] = view
+    return await channel.send(**kwargs)
 
 
 async def _edit_message_card(
@@ -455,17 +518,19 @@ async def _edit_message_card(
     embed: discord.Embed,
     state: UnifiedState,
     city: dict[str, Any] | None = None,
-    view: discord.ui.View | None = None,
+    view: discord.ui.View | discord.ui.LayoutView | None = None,
     content: str | None = None,
 ) -> discord.Message:
     embeds, file = _message_payload(kind, embed, city=city, state=state)
-    return await message.edit(
-        content=content,
-        embeds=embeds,
-        attachments=[file],
-        view=view,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    kwargs: dict[str, Any] = {
+        "content": content,
+        "embeds": embeds,
+        "attachments": [file],
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    if view is not None:
+        kwargs["view"] = view
+    return await message.edit(**kwargs)
 
 
 def _is_core_admin(user: discord.abc.User, guild: discord.Guild, admin_ids: set[int]) -> bool:
@@ -1188,7 +1253,11 @@ async def _edit_review_message(
         return
     try:
         message = await channel.fetch_message(message_id)
-        view = CityReviewView(bot, bot.unified_store, city_id) if city.get("status") == "pending" else None  # type: ignore[attr-defined]
+        view: discord.ui.View = (
+            CityReviewView(bot, bot.unified_store, city_id)  # type: ignore[attr-defined]
+            if city.get("status") == "pending"
+            else discord.ui.View(timeout=None)
+        )
         await _edit_message_card(
             message,
             kind="moderation",
@@ -3769,31 +3838,63 @@ async def publish_city_panels(
     store: UnifiedDiscordStore,
     guild: discord.Guild,
     state: UnifiedState,
+    *,
+    only_kind: str | None = None,
+    run_audit: bool = True,
 ) -> tuple[bool, str]:
-    admin_ids = getattr(bot, "admin_user_ids", set())
-    await _migrate_legacy_city_assets(bot, store, guild, state)
-    await _audit_city_state(bot, store, guild, state, admin_ids)
+    if only_kind not in {None, "application", "management"}:
+        return False, "Неизвестный тип панели городов."
 
+    async with _panel_publish_lock(guild.id):
+        admin_ids = getattr(bot, "admin_user_ids", set())
+        if run_audit:
+            await _migrate_legacy_city_assets(bot, store, guild, state)
+            await _audit_city_state(bot, store, guild, state, admin_ids)
+
+        return await _publish_city_panels_locked(
+            bot,
+            store,
+            guild,
+            state,
+            only_kind=only_kind,
+        )
+
+
+async def _publish_city_panels_locked(
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    guild: discord.Guild,
+    state: UnifiedState,
+    *,
+    only_kind: str | None,
+) -> tuple[bool, str]:
     application_channel = await _text_channel(bot, state.channels.get("city_application", 0))
     management_channel = await _text_channel(bot, state.channels.get("city_management", 0))
     review_channel = await _text_channel(bot, state.channels.get("city_review", 0))
     registry_channel = await _forum_channel(bot, state.channels.get("city_registry", 0))
     logs_channel = await _text_channel(bot, state.channels.get("city_logs", 0))
-    missing: list[str] = []
-    if application_channel is None:
-        missing.append("канал подачи")
-    if review_channel is None:
-        missing.append("канал рассмотрения")
-    if registry_channel is None:
-        missing.append("форум реестра")
-    if management_channel is None:
-        missing.append("канал управления")
-    if logs_channel is None:
-        missing.append("канал логов")
-    if missing:
-        return False, "Не настроены или удалены: " + ", ".join(missing) + "."
-    if not state.roles.get("city_mayor"):
-        return False, "Не выбрана роль мэра."
+    if only_kind == "application":
+        if application_channel is None:
+            return False, "Канал подачи заявок не настроен или удалён."
+    elif only_kind == "management":
+        if management_channel is None:
+            return False, "Канал управления городом не настроен или удалён."
+    else:
+        missing: list[str] = []
+        if application_channel is None:
+            missing.append("канал подачи")
+        if review_channel is None:
+            missing.append("канал рассмотрения")
+        if registry_channel is None:
+            missing.append("форум реестра")
+        if management_channel is None:
+            missing.append("канал управления")
+        if logs_channel is None:
+            missing.append("канал логов")
+        if missing:
+            return False, "Не настроены или удалены: " + ", ".join(missing) + "."
+        if not state.roles.get("city_mayor"):
+            return False, "Не выбрана роль мэра."
 
     accent = int(state.options.get("accent_color", 0x19B9D1))
 
@@ -3873,27 +3974,35 @@ async def publish_city_panels(
                     view=layout,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                # Discord мог уже закрыть переданный файл после неудачной попытки edit.
-                # Формируем свежий payload перед отправкой нового сообщения.
+            except discord.NotFound:
+                # Исходное сообщение действительно удалено — создаём его заново.
                 layout, banner_file = panel_payload(kind)
+            except (discord.Forbidden, discord.HTTPException):
+                # При 429/5xx нельзя сразу создавать дубликат панели. Ошибка
+                # передаётся наружу, а discord.py сам соблюдает Retry-After.
+                raise
         return await channel.send(
             file=banner_file,
             view=layout,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    updated: dict[str, discord.Message] = {}
     try:
-        application_message = await upsert(
-            application_channel,
-            "city_application",
-            kind="application",
-        )
-        management_message = await upsert(
-            management_channel,
-            "city_management",
-            kind="management",
-        )
+        if only_kind in {None, "application"}:
+            assert application_channel is not None
+            updated["application"] = await upsert(
+                application_channel,
+                "city_application",
+                kind="application",
+            )
+        if only_kind in {None, "management"}:
+            assert management_channel is not None
+            updated["management"] = await upsert(
+                management_channel,
+                "city_management",
+                kind="management",
+            )
     except Exception as exc:
         await _send_city_log(
             bot,
@@ -3902,26 +4011,35 @@ async def publish_city_panels(
             description=f"Discord вернул ошибку: `{exc}`",
             color=0xD85C5C,
         )
-        return False, f"Discord не опубликовал панели: {exc}"
+        return False, f"Discord не опубликовал панель: {exc}"
 
-    state.messages["city_application"] = application_message.id
-    state.messages["city_management"] = management_message.id
+    if "application" in updated:
+        state.messages["city_application"] = updated["application"].id
+    if "management" in updated:
+        state.messages["city_management"] = updated["management"].id
     try:
         await store.save(state)
     except Exception as exc:
-        return False, f"Панели отправлены, но их ID не сохранены: {exc}"
+        return False, f"Панель отправлена, но её ID не сохранён: {exc}"
 
-    await _send_city_log(
-        bot,
-        state,
-        title="🚀 Панели системы городов опубликованы",
-        description=(
-            f"Панель заявок: <#{application_channel.id}> (`{application_message.id}`).\n"
-            f"Панель управления: <#{management_channel.id}> (`{management_message.id}`)."
-        ),
-        color=0x59B77A,
-    )
-    return True, "Панели регистрации и управления городами опубликованы с локальными полноразмерными баннерами."
+    if only_kind is None:
+        application_message = updated["application"]
+        management_message = updated["management"]
+        assert application_channel is not None and management_channel is not None
+        await _send_city_log(
+            bot,
+            state,
+            title="🚀 Панели системы городов опубликованы",
+            description=(
+                f"Панель заявок: <#{application_channel.id}> (`{application_message.id}`).\n"
+                f"Панель управления: <#{management_channel.id}> (`{management_message.id}`)."
+            ),
+            color=0x59B77A,
+        )
+        return True, "Панели регистрации и управления городами опубликованы с локальными полноразмерными баннерами."
+
+    panel_name = "подачи заявок" if only_kind == "application" else "управления городом"
+    return True, f"Панель {panel_name} обновлена."
 
 
 class CityPanelBannerModal(discord.ui.Modal):
@@ -4002,7 +4120,6 @@ class CityPanelBannerModal(discord.ui.Modal):
         try:
             relative = await _save_attachment_local(attachment, destination)
             state.options[option_key] = relative
-            await self.store.save(state)
         except Exception as exc:
             state.options[option_key] = previous
             await _send_interaction_card(
@@ -4015,7 +4132,27 @@ class CityPanelBannerModal(discord.ui.Modal):
             )
             return
 
-        ok, text = await publish_city_panels(self.bot, self.store, interaction.guild, state)
+        # publish_city_panels сохраняет state после обновления нужной панели.
+        # Раньше здесь был отдельный store.save(), поэтому одна загрузка
+        # баннера дважды PATCH-ила служебное JSON-сообщение и провоцировала 429.
+        try:
+            ok, text = await publish_city_panels(
+                self.bot,
+                self.store,
+                interaction.guild,
+                state,
+                only_kind=self.target,
+                run_audit=False,
+            )
+        except Exception:
+            # Даже если Discord не смог обновить панель, выбранный локальный
+            # баннер не теряется после перезапуска. Сохраняем состояние один раз.
+            await self.store.save(state)
+            raise
+        if not ok:
+            # Целевой канал может быть ещё не настроен. В этом случае панель
+            # обновить нельзя, но путь к баннеру всё равно сохраняется.
+            await self.store.save(state)
         panel_name = "управления городом" if self.target == "management" else "подачи заявок"
         await _send_interaction_card(
             interaction,
@@ -4026,6 +4163,9 @@ class CityPanelBannerModal(discord.ui.Modal):
             followup=True,
             color=0x59B77A if ok else 0xF2B84B,
         )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await _notify_component_error(interaction, error, context="CityPanelBannerModal")
 
 
 class CityChannelSelect(discord.ui.ChannelSelect):
@@ -4199,6 +4339,18 @@ class CitySetupView(discord.ui.View):
         self.bot = bot
         self.store = store
 
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+    ) -> None:
+        await _notify_component_error(
+            interaction,
+            error,
+            context=f"CitySetupView/{item.__class__.__name__}",
+        )
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
             return False
@@ -4218,7 +4370,7 @@ class CitySetupView(discord.ui.View):
 
     @discord.ui.button(label="Каналы", emoji="📍", style=discord.ButtonStyle.secondary)
     async def channels(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        view = discord.ui.View(timeout=600)
+        view = CityTransientView(timeout=600)
         view.add_item(CityChannelSelect(self.store, "city_application", "Канал подачи заявок", discord.ChannelType.text))
         view.add_item(CityChannelSelect(self.store, "city_review", "Канал рассмотрения заявок", discord.ChannelType.text))
         view.add_item(CityChannelSelect(self.store, "city_registry", "Форум реестра городов", discord.ChannelType.forum))
@@ -4236,7 +4388,7 @@ class CitySetupView(discord.ui.View):
 
     @discord.ui.button(label="Роль Мэр", emoji="👑", style=discord.ButtonStyle.secondary)
     async def mayor_role(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        view = discord.ui.View(timeout=600)
+        view = CityTransientView(timeout=600)
         view.add_item(CityMayorRoleSelect(self.store))
         state = self.store.get(interaction.guild.id) if interaction.guild else None
         await _send_interaction_card(
@@ -4250,7 +4402,7 @@ class CitySetupView(discord.ui.View):
 
     @discord.ui.button(label="Роли администрации", emoji="🛡️", style=discord.ButtonStyle.secondary)
     async def staff_roles(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        view = discord.ui.View(timeout=600)
+        view = CityTransientView(timeout=600)
         view.add_item(CityStaffRoleSelect(self.bot, self.store))
         state = self.store.get(interaction.guild.id) if interaction.guild else None
         await _send_interaction_card(
@@ -4264,7 +4416,7 @@ class CitySetupView(discord.ui.View):
 
     @discord.ui.button(label="Разрешённые боты", emoji="🤖", style=discord.ButtonStyle.secondary)
     async def allowed_bots(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        view = discord.ui.View(timeout=600)
+        view = CityTransientView(timeout=600)
         view.add_item(CityAllowedBotsSelect(self.bot, self.store))
         state = self.store.get(interaction.guild.id) if interaction.guild else None
         await _send_interaction_card(

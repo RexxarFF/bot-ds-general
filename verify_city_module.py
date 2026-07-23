@@ -54,6 +54,10 @@ required_fragments = (
     'CityCitizenAddSelect',
     'CityCitizenRemoveView',
     'CityCitizenListView',
+    '_panel_publish_lock',
+    'only_kind=self.target',
+    'CityTransientView',
+    'if view is not None',
 )
 for fragment in required_fragments:
     if fragment not in source:
