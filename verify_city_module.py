@@ -48,7 +48,6 @@ required_fragments = (
     'WARNING_COOLDOWN_SECONDS',
     'city_management_banner_path',
     'edit_original_response',
-    'build_framed_view',
     'MAX_CITY_CITIZENS',
     '"citizenIds"',
     'CityCitizenAddSelect',
@@ -58,6 +57,9 @@ required_fragments = (
     'only_kind=self.target',
     'CityTransientView',
     'if view is not None',
+    'IS_COMPONENTS_V2',
+    'replace_incompatible_panel',
+    'message.flags.value',
 )
 for fragment in required_fragments:
     if fragment not in source:

@@ -343,17 +343,24 @@ def _city_custom_banner_path(city: dict[str, Any]) -> Path | None:
 
 
 def _banner_path(kind: str, city: dict[str, Any] | None = None, state: UnifiedState | None = None) -> Path:
-    if state is not None and city is None:
+    # Персональный баннер города используется только в официальной карточке
+    # реестра. Панель управления всегда использует отдельно выбранный общий
+    # баннер management, а не баннер конкретного города.
+    if city is not None and kind == "registry":
+        custom_city_banner = _city_custom_banner_path(city)
+        if custom_city_banner is not None:
+            return custom_city_banner
+
+    # Настроенный системный баннер должен работать даже когда карточка связана
+    # с конкретным городом (модерация, логи, уведомления, ошибки и т.д.).
+    if state is not None:
         option_key = BANNER_OPTION_KEYS.get(kind, "")
         custom = str(state.options.get(option_key, "") or "").strip() if option_key else ""
         if custom:
             path = _resolve_project_path(custom)
             if path.is_file():
                 return path
-    if city is not None and kind in {"registry", "management"}:
-        custom = _city_custom_banner_path(city)
-        if custom is not None:
-            return custom
+
     path = _static_banner_path(kind)
     if path.is_file():
         return path
@@ -3963,34 +3970,115 @@ async def _publish_city_panels_locked(
         embeds, banner_file = _message_payload(kind, content_embed, state=state)
         return embeds, banner_file, view
 
-    async def upsert(
-        channel: discord.TextChannel,
-        key: str,
-        *,
-        kind: str,
-    ) -> discord.Message:
+    def is_components_v2_message(message: discord.Message) -> bool:
+        # Discord permanently keeps IS_COMPONENTS_V2 (1 << 15) on a message.
+        # Such a message can no longer be edited with normal content/embeds.
+        # Use the raw flag value so this also works across discord.py 2.6/2.7.
+        return bool(int(message.flags.value) & (1 << 15))
+
+    def is_components_v2_conflict(error: discord.HTTPException) -> bool:
+        error_text = str(error).lower()
+        return (
+            int(getattr(error, "code", 0) or 0) == 50035
+            and (
+                "is_components_v2" in error_text
+                or "components_v2" in error_text
+                or "embeds' field cannot be used" in error_text
+                or 'embeds" field cannot be used' in error_text
+            )
+        )
+
+    async def create_panel(channel: discord.TextChannel, kind: str) -> discord.Message:
         embeds, banner_file, view = panel_payload(kind)
-        message_id = int(state.messages.get(key, 0) or 0)
-        if message_id:
-            try:
-                message = await channel.fetch_message(message_id)
-                return await message.edit(
-                    content=None,
-                    embeds=embeds,
-                    attachments=[banner_file],
-                    view=view,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except discord.NotFound:
-                embeds, banner_file, view = panel_payload(kind)
-            except (discord.Forbidden, discord.HTTPException):
-                raise
         return await channel.send(
             embeds=embeds,
             file=banner_file,
             view=view,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    async def replace_incompatible_panel(
+        channel: discord.TextChannel,
+        old_message: discord.Message,
+        *,
+        kind: str,
+        reason: str,
+    ) -> discord.Message:
+        # First create the compatible legacy-View + Embed message. This prevents
+        # the public panel from disappearing if Discord rejects the new send.
+        replacement = await create_panel(channel, kind)
+        try:
+            await old_message.delete()
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            log.warning(
+                "Не удалось удалить старую Components V2 панель %s в канале %s; новая панель %s уже создана",
+                old_message.id,
+                channel.id,
+                replacement.id,
+            )
+        except discord.HTTPException:
+            log.exception(
+                "Discord не удалил старую несовместимую панель %s после создания %s",
+                old_message.id,
+                replacement.id,
+            )
+        log.info(
+            "Панель городов пересоздана: kind=%s old=%s new=%s reason=%s",
+            kind,
+            old_message.id,
+            replacement.id,
+            reason,
+        )
+        return replacement
+
+    async def upsert(
+        channel: discord.TextChannel,
+        key: str,
+        *,
+        kind: str,
+    ) -> discord.Message:
+        message_id = int(state.messages.get(key, 0) or 0)
+        if not message_id:
+            return await create_panel(channel, kind)
+
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            return await create_panel(channel, kind)
+
+        # Messages once published with LayoutView/Components V2 can never be
+        # converted back to Embed messages. Automatically migrate them instead
+        # of repeatedly sending an invalid PATCH request.
+        if is_components_v2_message(message):
+            return await replace_incompatible_panel(
+                channel,
+                message,
+                kind=kind,
+                reason="message flag IS_COMPONENTS_V2",
+            )
+
+        embeds, banner_file, view = panel_payload(kind)
+        try:
+            return await message.edit(
+                content=None,
+                embeds=embeds,
+                attachments=[banner_file],
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException as exc:
+            # Extra protection for stale Discord cache / messages created by an
+            # older bot build where the flag is only revealed by the API error.
+            if is_components_v2_conflict(exc):
+                return await replace_incompatible_panel(
+                    channel,
+                    message,
+                    kind=kind,
+                    reason=f"Discord API conflict {getattr(exc, 'code', 0)}",
+                )
+            raise
 
     updated: dict[str, discord.Message] = {}
     try:
@@ -4133,27 +4221,56 @@ class CityPanelBannerModal(discord.ui.Modal):
             )
             return
 
-        # publish_city_panels сохраняет state после обновления нужной панели.
-        # Раньше здесь был отдельный store.save(), поэтому одна загрузка
-        # баннера дважды PATCH-ила служебное JSON-сообщение и провоцировала 429.
+        # Публичные панели application/management обновляются через отдельный
+        # upsert. Остальные типы баннеров не являются отдельными панелями и не
+        # должны передаваться в publish_city_panels как неизвестный only_kind.
         try:
-            ok, text = await publish_city_panels(
-                self.bot,
-                self.store,
-                interaction.guild,
-                state,
-                only_kind=self.target,
-                run_audit=False,
-            )
+            if self.target in {"application", "management"}:
+                ok, text = await publish_city_panels(
+                    self.bot,
+                    self.store,
+                    interaction.guild,
+                    state,
+                    only_kind=self.target,
+                    run_audit=False,
+                )
+                if not ok:
+                    # Канал может быть ещё не настроен. Сам выбранный баннер
+                    # всё равно сохраняется и применится после публикации.
+                    await self.store.save(state)
+            elif self.target == "moderation":
+                updated_count = 0
+                for city_id, city in list(state.cities.items()):
+                    if city.get("status") != "pending":
+                        continue
+                    await _edit_review_message(self.bot, state, city_id, city)
+                    updated_count += 1
+                await self.store.save(state)
+                ok = True
+                text = f"Обновлено карточек заявок: {updated_count}."
+            elif self.target == "registry":
+                updated_count = 0
+                failed_count = 0
+                for city_id, city in list(state.cities.items()):
+                    if city.get("status") != "approved":
+                        continue
+                    synced, _ = await sync_registry_post(self.bot, state, city_id, city)
+                    if synced:
+                        updated_count += 1
+                    else:
+                        failed_count += 1
+                await self.store.save(state)
+                ok = True
+                text = f"Обновлено карточек реестра: {updated_count}; недоступно: {failed_count}."
+            else:
+                await self.store.save(state)
+                ok = True
+                text = "Баннер сохранён и будет использоваться во всех новых сообщениях этого типа."
         except Exception:
-            # Даже если Discord не смог обновить панель, выбранный локальный
-            # баннер не теряется после перезапуска. Сохраняем состояние один раз.
+            # Даже если Discord не смог обновить существующую карточку, локально
+            # выбранный баннер не теряется после перезапуска.
             await self.store.save(state)
             raise
-        if not ok:
-            # Целевой канал может быть ещё не настроен. В этом случае панель
-            # обновить нельзя, но путь к баннеру всё равно сохраняется.
-            await self.store.save(state)
         panel_name = BANNER_LABELS.get(self.target, "системы городов")
         await _send_interaction_card(
             interaction,
