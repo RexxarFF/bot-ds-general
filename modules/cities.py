@@ -3645,13 +3645,16 @@ class CityInvitationCancelSelect(discord.ui.Select):
                 city=previous,
             )
             return
+        removed_mentions = ", ".join(
+            f"<@{int(item.get('userId', 0))}>" for item in removed
+        )
         await _send_city_log(
             self.bot,
             state,
             title="🚫 Отменены приглашения в город",
             description=(
                 f"Инициатор: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
-                f"Отменены для: {', '.join(f'<@{int(item.get("userId", 0))}>' for item in removed)}."
+                f"Отменены для: {removed_mentions}."
             ),
             city_id=self.city_id,
             city=city,
