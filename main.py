@@ -28,6 +28,11 @@ from modules.government import (
     publish_government_panel,
     GovernmentSetupView,
 )
+from modules.cities import (
+    setup_cities,
+    publish_city_panels,
+    CitySetupView,
+)
 
 
 # ============================================================
@@ -2090,6 +2095,22 @@ class UnifiedSetupView(discord.ui.View):
             ephemeral=True,
         )
 
+    @discord.ui.button(label="Города", emoji="🏰", style=discord.ButtonStyle.secondary)
+    async def cities(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state = self.bot.unified_store.get(interaction.guild.id) or await self.bot.unified_store.load_or_create(interaction.guild)
+        embed = discord.Embed(
+            title="⚙️ Настройка системы городов",
+            description="Регистрация, модерация, форум-реестр, роль мэра и синхронное управление карточками.",
+            color=int(state.options.get("accent_color", 0x19B9D1)),
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=CitySetupView(self.bot, self.bot.unified_store),
+            ephemeral=True,
+        )
+
 
 # ============================================================
 # БОТ
@@ -2118,6 +2139,7 @@ class FunFernusBot(commands.Bot):
         self.add_view(ControlPanelView(self))
         await setup_community(self, self.unified_store, ADMIN_USER_IDS)
         await setup_government(self, self.unified_store, ADMIN_USER_IDS)
+        await setup_cities(self, self.unified_store, ADMIN_USER_IDS)
 
         if GUILD_ID:
             guild_object = discord.Object(id=GUILD_ID)
@@ -2144,6 +2166,7 @@ async def unified_setup(interaction: discord.Interaction) -> None:
             "• **Заявки** — анкета, рассмотрение, роли и RCON.\n"
             "• **Сообщество** — поддержка, предложения и приветствие.\n"
             "• **Правительство** — судебные иски и судьи.\n"
+            "• **Города** — заявки, модерация, реестр и управление карточками.\n"
             "• `/публикация` — красивое сообщение с баннером в текущем канале."
         ),
         color=config.COLOR_CONTROL,
@@ -2190,6 +2213,8 @@ async def on_ready() -> None:
                 await publish_support_panel(bot, bot.unified_store, guild, unified_state)
             if unified_state.channels.get("government_panel") and unified_state.channels.get("government_review"):
                 await publish_government_panel(bot, bot.unified_store, guild, unified_state)
+            if unified_state.channels.get("city_application") and unified_state.channels.get("city_management"):
+                await publish_city_panels(bot, bot.unified_store, guild, unified_state)
         except Exception:
             log.exception("Не удалось загрузить объединённое хранилище для сервера %s", guild.id)
 

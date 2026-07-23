@@ -47,19 +47,27 @@ class UnifiedState:
         "government_panel": 0,
         "government_review": 0,
         "government_logs": 0,
+        "city_application": 0,
+        "city_review": 0,
+        "city_registry": 0,
+        "city_management": 0,
     })
     roles: dict[str, list[int]] = field(default_factory=lambda: {
         "support_staff": [],
         "government_judges": [],
+        "city_mayor": [],
     })
     messages: dict[str, int] = field(default_factory=lambda: {
         "support_panel": 0,
         "government_panel": 0,
+        "city_application": 0,
+        "city_management": 0,
     })
     assets: dict[str, dict[str, Any]] = field(default_factory=lambda: {
         "support_panel": asdict(AssetRef()),
         "welcome": asdict(AssetRef()),
         "government_panel": asdict(AssetRef()),
+        "city_application_panel": asdict(AssetRef()),
     })
     texts: dict[str, str] = field(default_factory=lambda: {
         "support_title": "Поддержка FunFernus",
@@ -70,6 +78,9 @@ class UnifiedState:
         "government_footer": "FunFernus • Правительство",
         "welcome_title": "Добро пожаловать на FunFernus!",
         "welcome_text": "Рады видеть вас на сервере. Ознакомьтесь с правилами и подайте заявку через панель сервера.",
+        "city_application_title": "Регистрация города FunFernus",
+        "city_application_description": "Нажмите кнопку ниже, выберите руководство и заполните данные будущего города.",
+        "city_application_footer": "FunFernus • Реестр городов",
     })
     options: dict[str, Any] = field(default_factory=lambda: {
         "accent_color": 0x19B9D1,
@@ -81,10 +92,13 @@ class UnifiedState:
         "suggestion": 0,
         "complaint": 0,
         "case": 0,
+        "city": 0,
     })
     tickets: dict[str, dict[str, Any]] = field(default_factory=dict)
     cases: dict[str, dict[str, Any]] = field(default_factory=dict)
     active_drafts: dict[str, str] = field(default_factory=dict)
+    cities: dict[str, dict[str, Any]] = field(default_factory=dict)
+    city_drafts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: Any) -> "UnifiedState":
@@ -94,7 +108,7 @@ class UnifiedState:
         for name in ("schema", "guild_id", "config_channel_id", "state_message_id"):
             if name in raw:
                 setattr(state, name, int(raw[name] or 0))
-        for name in ("channels", "roles", "messages", "texts", "options", "counters", "tickets", "cases", "active_drafts"):
+        for name in ("channels", "roles", "messages", "texts", "options", "counters", "tickets", "cases", "active_drafts", "cities", "city_drafts"):
             value = raw.get(name)
             if isinstance(value, dict):
                 current = getattr(state, name)

@@ -13,6 +13,7 @@ required = [
     "modules/components.py",
     "modules/community.py",
     "modules/government.py",
+    "modules/cities.py",
     "requirements.txt",
     ".env.example",
 ]
