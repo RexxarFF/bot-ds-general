@@ -1538,7 +1538,7 @@ class PanelBannerUploadModal(discord.ui.Modal):
         self.guild_id = guild_id
         self.file_field = discord.ui.Label(
             text="Выберите файл баннера",
-            description="Широкий баннер PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1600×600.",
+            description="Широкий баннер PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1200×630 или 1600×840.",
             component=discord.ui.FileUpload(
                 custom_id="funfernus_panel_banner_file",
                 required=True,
@@ -1572,7 +1572,7 @@ class PanelBannerUploadModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True, thinking=True)
         config_channel = await get_text_channel(self.bot, settings.config_channel_id)
         if config_channel is None:
-            await interaction.followup.send("Канал bot-config не найден.", ephemeral=True)
+            await interaction.edit_original_response(content="❌ Канал bot-config не найден.")
             return
 
         try:
@@ -1582,11 +1582,11 @@ class PanelBannerUploadModal(discord.ui.Modal):
                 file=discord.File(io.BytesIO(data), filename=image.filename),
             )
         except discord.HTTPException as exc:
-            await interaction.followup.send(f"Не удалось сохранить баннер: `{exc}`", ephemeral=True)
+            await interaction.edit_original_response(content=f"❌ Не удалось сохранить баннер: `{exc}`")
             return
 
         if not asset_message.attachments:
-            await interaction.followup.send("Discord не вернул сохранённое вложение.", ephemeral=True)
+            await interaction.edit_original_response(content="❌ Discord не вернул сохранённое вложение.")
             return
 
         old_id = int(settings.banner_asset_message_id or 0)
@@ -1603,7 +1603,9 @@ class PanelBannerUploadModal(discord.ui.Modal):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
-        await interaction.followup.send("Баннер загружен из файла и сохранён в config-канале.", ephemeral=True)
+        await interaction.edit_original_response(
+            content="✅ Баннер загружен из файла, сохранён и применён. Индикатор загрузки закрыт."
+        )
 
 
 class PanelBannerActionView(discord.ui.View):

@@ -15,6 +15,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .components import build_framed_view
 from .unified_store import AssetRef, UnifiedDiscordStore, UnifiedState
 
 log = logging.getLogger("funfernus-cities")
@@ -24,6 +25,7 @@ DISCORD_ID_RE = re.compile(r"\d{15,22}")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 MAX_SCREENSHOTS = 10
+MAX_CITY_CITIZENS = 100
 WARNING_COOLDOWN_SECONDS = 45.0
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -101,6 +103,92 @@ def _mayor_id(city: dict[str, Any]) -> int:
 
 def _deputy_id(city: dict[str, Any]) -> int:
     return int(city.get("deputyId", city.get("deputy_id", 0)) or 0)
+
+
+def _citizen_ids(city: dict[str, Any]) -> list[int]:
+    raw = city.get("citizenIds", city.get("citizen_ids", []))
+    if not isinstance(raw, list):
+        return []
+    leaders = {_mayor_id(city), _deputy_id(city)}
+    result: list[int] = []
+    for item in raw:
+        try:
+            user_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0 or user_id in leaders or user_id in result:
+            continue
+        result.append(user_id)
+    return result[:MAX_CITY_CITIZENS]
+
+
+def _set_citizen_ids(city: dict[str, Any], values: Iterable[int]) -> None:
+    leaders = {_mayor_id(city), _deputy_id(city)}
+    clean: list[int] = []
+    for item in values:
+        try:
+            user_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0 or user_id in leaders or user_id in clean:
+            continue
+        clean.append(user_id)
+        if len(clean) >= MAX_CITY_CITIZENS:
+            break
+    city["citizenIds"] = clean
+    city["citizen_ids"] = list(clean)
+
+
+def _citizen_absent_ids(city: dict[str, Any]) -> set[int]:
+    raw = city.get("citizenAbsentIds", city.get("citizen_absent_ids", []))
+    if not isinstance(raw, list):
+        return set()
+    valid = set(_citizen_ids(city))
+    result: set[int] = set()
+    for item in raw:
+        try:
+            user_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if user_id in valid:
+            result.add(user_id)
+    return result
+
+
+def _set_citizen_absent_ids(city: dict[str, Any], values: Iterable[int]) -> None:
+    valid = set(_citizen_ids(city))
+    clean = sorted({int(item) for item in values if str(item).isdigit() and int(item) in valid})
+    city["citizenAbsentIds"] = clean
+    city["citizen_absent_ids"] = list(clean)
+
+
+def _citizen_preview(city: dict[str, Any], *, limit: int = 15) -> str:
+    citizens = _citizen_ids(city)
+    if not citizens:
+        return "Горожане пока не добавлены."
+    absent = _citizen_absent_ids(city)
+    lines = [
+        f"{index}. <@{user_id}> — `{user_id}`" + (" • ⚠️ покинул сервер" if user_id in absent else "")
+        for index, user_id in enumerate(citizens[:limit], 1)
+    ]
+    if len(citizens) > limit:
+        lines.append(f"…и ещё **{len(citizens) - limit}**")
+    return _trim("\n".join(lines), 1024)
+
+
+def _find_person_city(
+    state: UnifiedState,
+    user_id: int,
+    *,
+    exclude: str = "",
+) -> tuple[str, dict[str, Any]] | None:
+    for city_id, city in state.cities.items():
+        if city_id == exclude or city.get("status") not in {"pending", "approved"}:
+            continue
+        _normalize_city(city)
+        if user_id in {_mayor_id(city), _deputy_id(city)} or user_id in _citizen_ids(city):
+            return city_id, city
+    return None
 
 
 def _set_leaders(city: dict[str, Any], mayor_id: int, deputy_id: int) -> None:
@@ -223,8 +311,13 @@ def _city_custom_banner_path(city: dict[str, Any]) -> Path | None:
 
 
 def _banner_path(kind: str, city: dict[str, Any] | None = None, state: UnifiedState | None = None) -> Path:
-    if kind == "application" and state is not None:
-        custom = str(state.options.get("city_application_banner_path", "") or "").strip()
+    if state is not None and city is None and kind in {"application", "management"}:
+        option_key = (
+            "city_application_banner_path"
+            if kind == "application"
+            else "city_management_banner_path"
+        )
+        custom = str(state.options.get(option_key, "") or "").strip()
         if custom:
             path = _resolve_project_path(custom)
             if path.is_file():
@@ -306,7 +399,19 @@ async def _send_interaction_card(
         "allowed_mentions": discord.AllowedMentions.none(),
     }
     if followup:
-        await interaction.followup.send(**kwargs)
+        # После defer(thinking=True) необходимо редактировать исходный ответ.
+        # Обычный followup создавал новое сообщение, а индикатор «бот думает»
+        # оставался висеть бесконечно, хотя панель уже была обновлена.
+        try:
+            await interaction.edit_original_response(
+                content=None,
+                embeds=embeds,
+                attachments=[file],
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.NotFound, discord.HTTPException):
+            await interaction.followup.send(**kwargs)
     else:
         await interaction.response.send_message(**kwargs)
 
@@ -520,6 +625,13 @@ def _normalize_city(city: dict[str, Any]) -> None:
     city.setdefault("allowed_writer_ids", list(city.get("allowedWriterIds", [])))
     city.setdefault("allowedRoleIds", list(city.get("allowed_role_ids", [])))
     city.setdefault("allowed_role_ids", list(city.get("allowedRoleIds", [])))
+    _set_citizen_ids(city, _citizen_ids(city))
+    _set_citizen_absent_ids(city, _citizen_absent_ids(city))
+    history = city.get("citizenHistory", city.get("citizen_history", []))
+    if not isinstance(history, list):
+        history = []
+    city["citizenHistory"] = history
+    city["citizen_history"] = history
     city.setdefault("mayorPresent", bool(city.get("mayor_present", True)))
     city.setdefault("deputyPresent", bool(city.get("deputy_present", True)))
     city["mayor_present"] = bool(city["mayorPresent"])
@@ -677,6 +789,7 @@ def city_review_embed(city_id: str, city: dict[str, Any], state: UnifiedState) -
         embed.add_field(name="Ответ мэра", value=_trim(latest.get("answer"), 700, "Ответ ещё не получен."), inline=False)
 
     if status == "approved":
+        embed.add_field(name=f"Горожане • {len(_citizen_ids(city))}", value=_citizen_preview(city), inline=False)
         embed.add_field(name="Одобрил", value=f"<@{int(city.get('reviewer_id', 0))}>", inline=True)
         thread_id = _get_message_id(city, "registryThreadId", "registry_thread_id")
         if thread_id:
@@ -710,6 +823,11 @@ def city_registry_embed(city_id: str, city: dict[str, Any], state: UnifiedState)
         inline=False,
     )
     embed.add_field(
+        name=f"Горожане • {len(_citizen_ids(city))}",
+        value=_citizen_preview(city),
+        inline=False,
+    )
+    embed.add_field(
         name="Кто может писать в этой публикации",
         value="Мэр, заместитель мэра, настроенная администрация и разрешённые боты. Остальные сообщения удаляются автоматически.",
         inline=False,
@@ -737,6 +855,11 @@ def city_management_embed(city_id: str, city: dict[str, Any], state: UnifiedStat
     embed.add_field(name="Верхний мир", value=_trim(city.get("overworld_coords"), 500), inline=True)
     embed.add_field(name="Нижний мир", value=_trim(city.get("nether_coords"), 500), inline=True)
     embed.add_field(name="Главный баннер", value="Установлен локальным файлом" if city.get("bannerPath") else "Используется системный баннер", inline=False)
+    embed.add_field(
+        name=f"Горожане • {len(_citizen_ids(city))}",
+        value=_citizen_preview(city),
+        inline=False,
+    )
     embed.add_field(name="Публикация реестра", value=_registry_status(city), inline=False)
     embed.set_footer(text="FunFernus • Панель мэра")
     return embed
@@ -1283,12 +1406,23 @@ class MayorDeputyView(discord.ui.View):
                 state=state,
             )
             return
-        if _has_active_city(state, self.mayor_id):
+        mayor_city = _find_person_city(state, self.mayor_id)
+        deputy_city = _find_person_city(state, self.deputy_id)
+        if mayor_city is not None:
             await _send_interaction_card(
                 interaction,
                 kind="warning",
-                title="❌ У мэра уже есть город",
-                description="У выбранного мэра уже имеется активный город или заявка на рассмотрении.",
+                title="❌ Мэр уже состоит в городе",
+                description=f"Выбранный мэр уже связан с городом `{mayor_city[0]}` как руководитель или горожанин.",
+                state=state,
+            )
+            return
+        if deputy_city is not None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Заместитель уже состоит в городе",
+                description=f"Выбранный заместитель уже связан с городом `{deputy_city[0]}` как руководитель или горожанин.",
                 state=state,
             )
             return
@@ -1377,12 +1511,13 @@ class CityDetailsModal(discord.ui.Modal):
                 state=state,
             )
             return
-        if _has_active_city(state, self.mayor_id):
+        occupied = _find_person_city(state, self.mayor_id) or _find_person_city(state, self.deputy_id)
+        if occupied is not None:
             await _send_interaction_card(
                 interaction,
                 kind="warning",
-                title="❌ Заявка уже существует",
-                description="У выбранного мэра уже появился активный город или заявка.",
+                title="❌ Руководитель уже состоит в городе",
+                description=f"Пока форма была открыта, один из выбранных руководителей оказался связан с городом `{occupied[0]}`.",
                 state=state,
             )
             return
@@ -1497,12 +1632,19 @@ class CityScreenshotsModal(discord.ui.Modal):
                 state=state,
             )
             return
-        if _has_active_city(state, _mayor_id(draft)) or _name_taken(state, str(draft.get("name", ""))):
+        leadership_occupied = (
+            _find_person_city(state, _mayor_id(draft))
+            or _find_person_city(state, _deputy_id(draft))
+        )
+        if leadership_occupied is not None or _name_taken(state, str(draft.get("name", ""))):
             await _send_interaction_card(
                 interaction,
                 kind="warning",
                 title="❌ Данные уже заняты",
-                description="Пока форма была открыта, появилась заявка с таким мэром или названием.",
+                description=(
+                    "Пока форма была открыта, название стало занято либо один из руководителей "
+                    "оказался связан с другим городом."
+                ),
                 state=state,
             )
             return
@@ -1570,6 +1712,12 @@ class CityScreenshotsModal(discord.ui.Modal):
             "deputyPresent": True,
             "registryStatus": "not_created",
             "registry_status": "not_created",
+            "citizenIds": [],
+            "citizen_ids": [],
+            "citizenHistory": [],
+            "citizen_history": [],
+            "citizenAbsentIds": [],
+            "citizen_absent_ids": [],
         }
         city.pop("token", None)
         _set_leaders(city, _mayor_id(draft), _deputy_id(draft))
@@ -2414,6 +2562,79 @@ class CityManagementView(discord.ui.View):
             )
         )
 
+    @discord.ui.button(label="Добавить горожан", emoji="➕", style=discord.ButtonStyle.success)
+    async def add_citizens(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None:
+            return
+        if len(_citizen_ids(city)) >= MAX_CITY_CITIZENS:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Достигнут лимит горожан",
+                description=f"В одном городе можно хранить не более **{MAX_CITY_CITIZENS}** горожан.",
+                state=state,
+                city=city,
+            )
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="management",
+            title="➕ Добавление горожан",
+            description=(
+                "Выберите участников Discord-сервера, которые состоят в вашем городе. "
+                "Мэр, заместитель, боты и участники другого города добавлены не будут."
+            ),
+            state=state,
+            city=city,
+            view=CityCitizenAddView(self.bot, self.store, self.city_id, self.mayor_id),
+        )
+
+    @discord.ui.button(label="Удалить горожан", emoji="➖", style=discord.ButtonStyle.danger)
+    async def remove_citizens(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None:
+            return
+        if not _citizen_ids(city):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="ℹ️ Список горожан пуст",
+                description="В городе пока нет добавленных горожан.",
+                state=state,
+                city=city,
+            )
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="management",
+            title="➖ Удаление горожан",
+            description="Выберите одного или нескольких участников, которых нужно исключить из списка города.",
+            state=state,
+            city=city,
+            view=CityCitizenRemoveView(self.bot, self.store, self.city_id, self.mayor_id, page=0, guild=interaction.guild),
+        )
+
+    @discord.ui.button(label="Список горожан", emoji="👥", style=discord.ButtonStyle.secondary)
+    async def citizens_list(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None:
+            return
+        embed = city_citizens_embed(self.city_id, city, interaction.guild, state, page=0)
+        embeds, file = _message_payload("management", embed, city=city, state=state)
+        await interaction.response.send_message(
+            embeds=embeds,
+            file=file,
+            view=CityCitizenListView(self.bot, self.store, self.city_id, self.mayor_id, page=0, total=len(_citizen_ids(city))),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     @discord.ui.button(label="Обновить статус", emoji="🔄", style=discord.ButtonStyle.secondary)
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.guild is None:
@@ -2436,6 +2657,429 @@ class CityManagementView(discord.ui.View):
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+
+
+def city_citizens_embed(
+    city_id: str,
+    city: dict[str, Any],
+    guild: discord.Guild,
+    state: UnifiedState,
+    *,
+    page: int = 0,
+) -> discord.Embed:
+    _normalize_city(city)
+    citizens = _citizen_ids(city)
+    page_size = 20
+    page_count = max(1, (len(citizens) + page_size - 1) // page_size)
+    page = min(max(page, 0), page_count - 1)
+    page_citizens = citizens[page * page_size : (page + 1) * page_size]
+    embed = discord.Embed(
+        title=f"👥 Горожане • {_trim(city.get('name'), 180)}",
+        description=(
+            "Список хранится исключительно по Discord ID. Смена ника или отображаемого имени не влияет "
+            "на принадлежность к городу. Мэр и заместитель показаны отдельно и не занимают места в списке горожан."
+        ),
+        color=int(state.options.get("accent_color", 0x19B9D1)),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Мэр", value=_leader_text(city, "mayor"), inline=True)
+    embed.add_field(name="Заместитель", value=_leader_text(city, "deputy"), inline=True)
+    embed.add_field(
+        name="Население",
+        value=(
+            f"**{len(citizens) + len({user_id for user_id in (_mayor_id(city), _deputy_id(city)) if user_id})}** "
+            f"с учётом руководства\n**{len(citizens)}** обычных горожан"
+        ),
+        inline=True,
+    )
+    if not page_citizens:
+        embed.add_field(name="Список", value="Горожане пока не добавлены.", inline=False)
+    else:
+        absent = _citizen_absent_ids(city)
+        lines: list[str] = []
+        for index, user_id in enumerate(page_citizens, page * page_size + 1):
+            member = guild.get_member(user_id)
+            is_absent = user_id in absent
+            status = "⚠️ Покинул сервер" if is_absent else "✅ На сервере"
+            display = member.display_name if member is not None else f"Discord ID {user_id}"
+            lines.append(f"{index}. **{_trim(display, 55)}** • <@{user_id}> — `{user_id}` • {status}")
+        embed.add_field(name="Список горожан", value=_trim("\n".join(lines), 4000), inline=False)
+    embed.set_footer(
+        text=f"FunFernus • {city_id} • Страница {page + 1}/{page_count} • Лимит: {MAX_CITY_CITIZENS}"
+    )
+    return embed
+
+
+class CityCitizenListView(discord.ui.View):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        mayor_id: int,
+        *,
+        page: int,
+        total: int,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.mayor_id = mayor_id
+        self.page_count = max(1, (max(total, 0) + 19) // 20)
+        self.page = min(max(page, 0), self.page_count - 1)
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.page_count - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        state, city = await _management_guard(interaction, self.store, self.city_id, self.mayor_id)
+        return state is not None and city is not None
+
+    async def _show_page(self, interaction: discord.Interaction, target_page: int) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None:
+            return
+        citizens = _citizen_ids(city)
+        page_count = max(1, (len(citizens) + 19) // 20)
+        target_page = min(max(target_page, 0), page_count - 1)
+        view = CityCitizenListView(
+            self.bot,
+            self.store,
+            self.city_id,
+            self.mayor_id,
+            page=target_page,
+            total=len(citizens),
+        )
+        content_embed = city_citizens_embed(
+            self.city_id,
+            city,
+            interaction.guild,
+            state,
+            page=target_page,
+        )
+        if interaction.message is None or not interaction.message.embeds:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Панель недоступна",
+                description="Сообщение со списком горожан больше недоступно. Откройте список заново.",
+                state=state,
+                city=city,
+            )
+            return
+        banner_embed = interaction.message.embeds[0]
+        await interaction.response.edit_message(embeds=[banner_embed, content_embed], view=view)
+
+    @discord.ui.button(label="Назад", emoji="⬅️", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._show_page(interaction, self.page - 1)
+
+    @discord.ui.button(label="Далее", emoji="➡️", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._show_page(interaction, self.page + 1)
+
+
+class CityCitizenAddSelect(discord.ui.UserSelect):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        mayor_id: int,
+    ) -> None:
+        super().__init__(
+            placeholder="Выберите новых горожан",
+            min_values=1,
+            max_values=10,
+        )
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.mayor_id = mayor_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        state, city = await _management_guard(interaction, self.store, self.city_id, self.mayor_id)
+        if state is None or city is None or interaction.guild is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        current = _citizen_ids(city)
+        added: list[int] = []
+        skipped: list[str] = []
+
+        for selected in self.values:
+            member = await _member(interaction.guild, selected.id)
+            if member is None:
+                skipped.append(f"`{selected.id}` — не найден на сервере")
+                continue
+            if member.bot:
+                skipped.append(f"<@{member.id}> — ботов нельзя добавлять")
+                continue
+            if member.id in {_mayor_id(city), _deputy_id(city)}:
+                skipped.append(f"<@{member.id}> — уже входит в руководство")
+                continue
+            if member.id in current or member.id in added:
+                skipped.append(f"<@{member.id}> — уже состоит в городе")
+                continue
+            other = _find_person_city(state, member.id, exclude=self.city_id)
+            if other is not None:
+                skipped.append(f"<@{member.id}> — уже состоит в городе `{other[0]}`")
+                continue
+            if len(current) + len(added) >= MAX_CITY_CITIZENS:
+                skipped.append(f"<@{member.id}> — достигнут лимит города")
+                continue
+            added.append(member.id)
+
+        if not added:
+            details = "\n".join(skipped[:10]) or "Подходящие участники не выбраны."
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Никого не удалось добавить",
+                description=_trim(details, 1800),
+                state=state,
+                city=city,
+                followup=True,
+            )
+            return
+
+        previous = copy.deepcopy(city)
+        _set_citizen_ids(city, [*current, *added])
+        _set_citizen_absent_ids(city, _citizen_absent_ids(city))
+        history = city.setdefault("citizenHistory", city.get("citizen_history", []))
+        history.append(
+            {
+                "action": "add",
+                "userIds": list(added),
+                "actorId": interaction.user.id,
+                "changedAt": _now_iso(),
+            }
+        )
+        city["citizen_history"] = history
+        async with _lock(interaction.guild.id, self.city_id):
+            ok, sync_text = await _save_and_sync(
+                interaction,
+                self.bot,
+                self.store,
+                state,
+                self.city_id,
+                city,
+                previous,
+            )
+        if ok:
+            await _send_city_log(
+                self.bot,
+                state,
+                title="➕ Добавлены горожане",
+                description=(
+                    f"Мэр: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+                    f"Добавлены: {', '.join(f'<@{user_id}> (`{user_id}`)' for user_id in added)}.\n"
+                    f"Теперь в списке: **{len(_citizen_ids(city))}**.\n"
+                    f"Синхронизация: {sync_text}"
+                ),
+                city_id=self.city_id,
+                city=city,
+                color=0x59B77A,
+            )
+        skipped_text = f"\n\nНе добавлены:\n{_trim(chr(10).join(skipped[:10]), 900)}" if skipped else ""
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Горожане добавлены" if ok else "❌ Изменения не сохранены",
+            description=(
+                f"Добавлено: **{len(added)}**. Всего горожан: **{len(_citizen_ids(city))}**.\n{sync_text}"
+                f"{skipped_text}"
+            ),
+            state=state,
+            city=city,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
+
+
+class CityCitizenAddView(discord.ui.View):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        mayor_id: int,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.add_item(CityCitizenAddSelect(bot, store, city_id, mayor_id))
+
+
+class CityCitizenRemoveSelect(discord.ui.Select):
+    def __init__(self, owner: "CityCitizenRemoveView", citizen_ids: list[int]) -> None:
+        options: list[discord.SelectOption] = []
+        guild = owner.guild
+        for user_id in citizen_ids:
+            member = guild.get_member(user_id) if guild is not None else None
+            label = _trim(member.display_name if member else f"Пользователь {user_id}", 90)
+            description = f"Discord ID: {user_id}" if member else f"Покинул сервер • ID: {user_id}"
+            options.append(discord.SelectOption(label=label, value=str(user_id), description=_trim(description, 100)))
+        super().__init__(
+            placeholder="Выберите горожан для удаления",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+            row=0,
+        )
+        self.owner = owner
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        state, city = await _management_guard(
+            interaction,
+            self.owner.store,
+            self.owner.city_id,
+            self.owner.mayor_id,
+        )
+        if state is None or city is None or interaction.guild is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        remove_ids = {int(item) for item in self.values if str(item).isdigit()}
+        current = _citizen_ids(city)
+        removed = [user_id for user_id in current if user_id in remove_ids]
+        if not removed:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Горожане не выбраны",
+                description="Выбранные Discord ID уже отсутствуют в списке города.",
+                state=state,
+                city=city,
+                followup=True,
+            )
+            return
+        previous = copy.deepcopy(city)
+        _set_citizen_ids(city, [user_id for user_id in current if user_id not in remove_ids])
+        _set_citizen_absent_ids(city, _citizen_absent_ids(city))
+        history = city.setdefault("citizenHistory", city.get("citizen_history", []))
+        history.append(
+            {
+                "action": "remove",
+                "userIds": list(removed),
+                "actorId": interaction.user.id,
+                "changedAt": _now_iso(),
+            }
+        )
+        city["citizen_history"] = history
+        async with _lock(interaction.guild.id, self.owner.city_id):
+            ok, sync_text = await _save_and_sync(
+                interaction,
+                self.owner.bot,
+                self.owner.store,
+                state,
+                self.owner.city_id,
+                city,
+                previous,
+            )
+        if ok:
+            await _send_city_log(
+                self.owner.bot,
+                state,
+                title="➖ Удалены горожане",
+                description=(
+                    f"Мэр: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+                    f"Удалены: {', '.join(f'<@{user_id}> (`{user_id}`)' for user_id in removed)}.\n"
+                    f"Осталось в списке: **{len(_citizen_ids(city))}**.\n"
+                    f"Синхронизация: {sync_text}"
+                ),
+                city_id=self.owner.city_id,
+                city=city,
+                color=0xF2B84B,
+            )
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Список горожан обновлён" if ok else "❌ Изменения не сохранены",
+            description=(
+                f"Удалено: **{len(removed)}**. Осталось: **{len(_citizen_ids(city))}**.\n{sync_text}"
+            ),
+            state=state,
+            city=city,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
+
+
+class CityCitizenRemoveView(discord.ui.View):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        mayor_id: int,
+        *,
+        page: int,
+        guild: discord.Guild | None = None,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.mayor_id = mayor_id
+        self.guild = guild
+        state = store.get(guild.id) if guild is not None else None
+        city = state.cities.get(city_id) if state else None
+        citizens = _citizen_ids(city or {})
+        self.page_count = max(1, (len(citizens) + 24) // 25)
+        self.page = min(max(page, 0), self.page_count - 1)
+        page_ids = citizens[self.page * 25 : (self.page + 1) * 25]
+        if page_ids:
+            self.add_item(CityCitizenRemoveSelect(self, page_ids))
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.page_count - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or interaction.user.id != self.mayor_id:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Эта панель списка горожан открыта другому мэру.",
+            )
+            return False
+        self.guild = interaction.guild
+        state = self.store.get(interaction.guild.id)
+        city = state.cities.get(self.city_id) if state else None
+        if city is None or _mayor_id(city) != interaction.user.id:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Доступ изменился",
+                description="Вы больше не управляете этим городом.",
+                state=state,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Назад", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = CityCitizenRemoveView(
+            self.bot,
+            self.store,
+            self.city_id,
+            self.mayor_id,
+            page=self.page - 1,
+            guild=interaction.guild,
+        )
+        await interaction.response.edit_message(view=view)
+
+    @discord.ui.button(label="Далее", emoji="➡️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = CityCitizenRemoveView(
+            self.bot,
+            self.store,
+            self.city_id,
+            self.mayor_id,
+            page=self.page + 1,
+            guild=interaction.guild,
+        )
+        await interaction.response.edit_message(view=view)
 
 
 async def _management_guard(
@@ -2816,13 +3460,16 @@ async def _replace_city_leader(
         return False, "Заместитель не может одновременно стать мэром без отдельной замены заместителя."
     if leader_type == "deputy" and new_member.id == old_mayor:
         return False, "Мэр и заместитель не могут быть одним человеком."
-    if leader_type == "mayor" and _has_active_city(state, new_member.id, exclude=city_id):
-        return False, "У нового мэра уже есть другой активный город или заявка."
+    other_city = _find_person_city(state, new_member.id, exclude=city_id)
+    if other_city is not None:
+        return False, f"Выбранный пользователь уже связан с другим городом `{other_city[0]}`."
 
     previous = copy.deepcopy(city)
     new_mayor = new_member.id if leader_type == "mayor" else old_mayor
     new_deputy = new_member.id if leader_type == "deputy" else old_deputy
     _set_leaders(city, new_mayor, new_deputy)
+    _set_citizen_ids(city, _citizen_ids(city))
+    _set_citizen_absent_ids(city, _citizen_absent_ids(city))
     city[f"{leader_type}Present"] = True
     city[f"{leader_type}_present"] = True
     city[f"{leader_type}ChangedAt"] = _now_iso()
@@ -3148,85 +3795,104 @@ async def publish_city_panels(
     if not state.roles.get("city_mayor"):
         return False, "Не выбрана роль мэра."
 
-    application_embed = discord.Embed(
-        title=str(state.texts.get("city_application_title", "Регистрация города FunFernus")),
-        description=str(
-            state.texts.get(
-                "city_application_description",
-                "Нажмите кнопку ниже, выберите мэра и заместителя, затем заполните данные города.",
-            )
-        ),
-        color=int(state.options.get("accent_color", 0x19B9D1)),
-        timestamp=datetime.now(timezone.utc),
-    )
-    application_embed.add_field(
-        name="Как проходит регистрация",
-        value=(
-            "1. Выбор мэра и заместителя через Discord User Select.\n"
-            "2. Заполнение названия, стиля, координат и описания.\n"
-            "3. Загрузка настоящих файлов скриншотов.\n"
-            "4. Рассмотрение администрацией и публикация в реестре."
-        ),
-        inline=False,
-    )
-    application_embed.set_footer(text=str(state.texts.get("city_application_footer", "FunFernus • Реестр городов")))
+    accent = int(state.options.get("accent_color", 0x19B9D1))
 
-    management_embed = discord.Embed(
-        title="⚙️ Управление зарегистрированным городом",
-        description=(
-            "Бот определяет город по вашему Discord ID. Через панель можно менять название, описание, "
-            "локальный главный баннер, координаты и архитектурный стиль."
-        ),
-        color=int(state.options.get("accent_color", 0x19B9D1)),
-        timestamp=datetime.now(timezone.utc),
-    )
-    management_embed.add_field(
-        name="Безопасность",
-        value=(
-            "Права не зависят от ника. Смена мэра и заместителя выполняется только настроенной администрацией. "
-            "Все изменения и ошибки записываются в отдельный канал логов."
-        ),
-        inline=False,
-    )
-    management_embed.set_footer(text="FunFernus • Управление городом")
+    def panel_payload(kind: str) -> tuple[discord.ui.LayoutView, discord.File]:
+        if kind == "application":
+            title = str(state.texts.get("city_application_title", "Регистрация города FunFernus"))
+            body = (
+                str(
+                    state.texts.get(
+                        "city_application_description",
+                        "Нажмите кнопку ниже, выберите мэра и заместителя, затем заполните данные города.",
+                    )
+                )
+                + "\n\n**Как проходит регистрация**\n"
+                + "• Выбор мэра и заместителя через меню пользователей Discord.\n"
+                + "• Заполнение названия, стиля, координат и описания.\n"
+                + "• Загрузка настоящих файлов скриншотов.\n"
+                + "• Рассмотрение администрацией и публикация в реестре."
+            )
+            footer = str(state.texts.get("city_application_footer", "FunFernus • Реестр городов"))
+            source_view = CityApplicationPanelView(bot, store)
+        else:
+            title = "⚙️ Управление зарегистрированным городом"
+            body = (
+                "Бот определяет город по вашему Discord ID. Через панель можно менять название, описание, "
+                "главный баннер, координаты и архитектурный стиль.\n\n"
+                "**Безопасность**\n"
+                "• Права не зависят от ника.\n"
+                "• Руководство меняет только настроенная администрация.\n"
+                "• Все изменения и ошибки записываются в отдельный канал логов."
+            )
+            footer = "FunFernus • Управление городом"
+            source_view = CityManagementLauncherView(bot, store)
+
+        source_button = next(
+            item for item in source_view.children if isinstance(item, discord.ui.Button)
+        )
+        button = discord.ui.Button(
+            label=source_button.label,
+            emoji=source_button.emoji,
+            style=source_button.style,
+            custom_id=source_button.custom_id,
+        )
+        button.callback = source_button.callback
+        action_row = discord.ui.ActionRow()
+        action_row.add_item(button)
+
+        path = _banner_path(kind, state=state)
+        suffix = path.suffix.lower() if path.suffix.lower() in IMAGE_EXTENSIONS else ".png"
+        filename = f"funfernus_city_{kind}_panel{suffix}"
+        layout = build_framed_view(
+            title=title,
+            body=body,
+            banner_url=f"attachment://{filename}",
+            color=accent,
+            footer=footer,
+            action_row=action_row,
+            timeout=None,
+        )
+        return layout, discord.File(path, filename=filename)
 
     async def upsert(
         channel: discord.TextChannel,
         key: str,
         *,
         kind: str,
-        embed: discord.Embed,
-        view: discord.ui.View,
     ) -> discord.Message:
+        layout, banner_file = panel_payload(kind)
         message_id = int(state.messages.get(key, 0) or 0)
         if message_id:
             try:
                 message = await channel.fetch_message(message_id)
-                return await _edit_message_card(
-                    message,
-                    kind=kind,
-                    embed=embed,
-                    state=state,
-                    view=view,
+                return await message.edit(
+                    content=None,
+                    embeds=[],
+                    attachments=[banner_file],
+                    view=layout,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-        return await _send_channel_card(channel, kind=kind, embed=embed, state=state, view=view)
+                # Discord мог уже закрыть переданный файл после неудачной попытки edit.
+                # Формируем свежий payload перед отправкой нового сообщения.
+                layout, banner_file = panel_payload(kind)
+        return await channel.send(
+            file=banner_file,
+            view=layout,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     try:
         application_message = await upsert(
             application_channel,
             "city_application",
             kind="application",
-            embed=application_embed,
-            view=CityApplicationPanelView(bot, store),
         )
         management_message = await upsert(
             management_channel,
             "city_management",
             kind="management",
-            embed=management_embed,
-            view=CityManagementLauncherView(bot, store),
         )
     except Exception as exc:
         await _send_city_log(
@@ -3259,15 +3925,22 @@ async def publish_city_panels(
 
 
 class CityPanelBannerModal(discord.ui.Modal):
-    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
-        super().__init__(title="Баннер панели регистрации городов", timeout=600)
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        target: str,
+    ) -> None:
+        self.target = "management" if target == "management" else "application"
+        label = "управления городом" if self.target == "management" else "регистрации городов"
+        super().__init__(title=f"Баннер панели {label}", timeout=600)
         self.bot = bot
         self.store = store
         self.file_label = discord.ui.Label(
-            text="Большой локальный баннер",
-            description="PNG/JPG/WEBP/GIF до 10 МБ. Файл сохранится в assets/banners/cities/.",
+            text="Большой полноразмерный баннер",
+            description="PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуемый размер: 1200×630 или 1600×840.",
             component=discord.ui.FileUpload(
-                custom_id="city_panel_banner_file",
+                custom_id=f"city_{self.target}_panel_banner_file",
                 required=True,
                 min_values=1,
                 max_values=1,
@@ -3289,7 +3962,7 @@ class CityPanelBannerModal(discord.ui.Modal):
                 interaction,
                 kind="warning",
                 title="❌ Нет доступа",
-                description="Изменять баннер системы городов может только администрация.",
+                description="Изменять баннеры системы городов может только администрация.",
                 state=state,
             )
             return
@@ -3316,16 +3989,22 @@ class CityPanelBannerModal(discord.ui.Modal):
                 state=state,
             )
             return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
         suffix = _safe_extension(attachment.filename, attachment.content_type or "")
-        destination = STATIC_BANNER_DIR / f"custom_application{suffix}"
-        previous = str(state.options.get("city_application_banner_path", "") or "")
+        option_key = (
+            "city_management_banner_path"
+            if self.target == "management"
+            else "city_application_banner_path"
+        )
+        destination = STATIC_BANNER_DIR / f"custom_{self.target}{suffix}"
+        previous = str(state.options.get(option_key, "") or "")
         try:
             relative = await _save_attachment_local(attachment, destination)
-            state.options["city_application_banner_path"] = relative
+            state.options[option_key] = relative
             await self.store.save(state)
         except Exception as exc:
-            state.options["city_application_banner_path"] = previous
+            state.options[option_key] = previous
             await _send_interaction_card(
                 interaction,
                 kind="warning",
@@ -3335,12 +4014,14 @@ class CityPanelBannerModal(discord.ui.Modal):
                 followup=True,
             )
             return
+
         ok, text = await publish_city_panels(self.bot, self.store, interaction.guild, state)
+        panel_name = "управления городом" if self.target == "management" else "подачи заявок"
         await _send_interaction_card(
             interaction,
             kind="notification" if ok else "warning",
             title="✅ Баннер установлен" if ok else "⚠️ Баннер сохранён",
-            description=text,
+            description=f"Баннер панели **{panel_name}** обновлён. {text}",
             state=state,
             followup=True,
             color=0x59B77A if ok else 0xF2B84B,
@@ -3595,9 +4276,17 @@ class CitySetupView(discord.ui.View):
             view=view,
         )
 
-    @discord.ui.button(label="Большой баннер", emoji="🖼️", style=discord.ButtonStyle.primary)
-    async def banner(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(CityPanelBannerModal(self.bot, self.store))
+    @discord.ui.button(label="Баннер заявок", emoji="🏰", style=discord.ButtonStyle.primary)
+    async def application_banner(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(
+            CityPanelBannerModal(self.bot, self.store, "application")
+        )
+
+    @discord.ui.button(label="Баннер управления", emoji="⚙️", style=discord.ButtonStyle.primary)
+    async def management_banner(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(
+            CityPanelBannerModal(self.bot, self.store, "management")
+        )
 
     @discord.ui.button(label="Опубликовать панели", emoji="🚀", style=discord.ButtonStyle.success)
     async def publish(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -3606,6 +4295,7 @@ class CitySetupView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         state = self.store.get(interaction.guild.id)
         if state is None:
+            await interaction.edit_original_response(content="❌ Состояние системы городов не загружено.")
             return
         ok, text = await publish_city_panels(self.bot, self.store, interaction.guild, state)
         await _send_interaction_card(
@@ -3634,8 +4324,9 @@ async def send_city_setup_message(
     embed = discord.Embed(
         title="⚙️ Настройка системы городов",
         description=(
-            "Настройте пять каналов, роль мэра, роли администрации, разрешённых ботов и локальный баннер. "
-            "Все изображения системы городов отправляются настоящими файлами через `attachment://`, без внешних URL."
+            "Настройте пять каналов, роль мэра, роли администрации, разрешённых ботов и два отдельных баннера: "
+            "для подачи заявок и для управления городом. Все изображения системы городов отправляются "
+            "настоящими файлами через `attachment://`, без внешних URL."
         ),
         color=int(state.options.get("accent_color", 0x19B9D1)),
         timestamp=datetime.now(timezone.utc),
@@ -3650,6 +4341,24 @@ async def send_city_setup_message(
         name="Канал логов",
         value=f"<#{state.channels.get('city_logs', 0)}>" if state.channels.get("city_logs", 0) else "Не выбран",
         inline=False,
+    )
+    embed.add_field(
+        name="Баннер панели заявок",
+        value=(
+            "Выбран собственный локальный файл"
+            if state.options.get("city_application_banner_path")
+            else "Используется встроенный большой баннер"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Баннер панели управления",
+        value=(
+            "Выбран собственный локальный файл"
+            if state.options.get("city_management_banner_path")
+            else "Используется встроенный большой баннер"
+        ),
+        inline=True,
     )
     embed.set_footer(text="FunFernus • Настройка городов")
     embeds, file = _message_payload("setup", embed, state=state)
@@ -3999,27 +4708,39 @@ async def _handle_member_presence_change(
     state = store.get(member.guild.id)
     if state is None:
         return
-    changed: list[tuple[str, dict[str, Any], str]] = []
+    leader_changes: list[tuple[str, dict[str, Any], str]] = []
+    citizen_changes: list[tuple[str, dict[str, Any]]] = []
     for city_id, city in state.cities.items():
+        _normalize_city(city)
         role = ""
         if _mayor_id(city) == member.id:
             role = "mayor"
         elif _deputy_id(city) == member.id:
             role = "deputy"
-        if not role:
+        if role:
+            city[f"{role}Present"] = present
+            city[f"{role}_present"] = present
+            city[f"{role}{'JoinedAt' if present else 'LeftAt'}"] = _now_iso()
+            city[f"{role}_{'joined_at' if present else 'left_at'}"] = city[f"{role}{'JoinedAt' if present else 'LeftAt'}"]
+            leader_changes.append((city_id, city, role))
             continue
-        city[f"{role}Present"] = present
-        city[f"{role}_present"] = present
-        city[f"{role}{'JoinedAt' if present else 'LeftAt'}"] = _now_iso()
-        city[f"{role}_{'joined_at' if present else 'left_at'}"] = city[f"{role}{'JoinedAt' if present else 'LeftAt'}"]
-        changed.append((city_id, city, role))
-    if not changed:
+        if member.id in _citizen_ids(city):
+            absent = _citizen_absent_ids(city)
+            if present:
+                absent.discard(member.id)
+            else:
+                absent.add(member.id)
+            _set_citizen_absent_ids(city, absent)
+            citizen_changes.append((city_id, city))
+
+    if not leader_changes and not citizen_changes:
         return
     try:
         await store.save(state)
     except Exception:
-        log.exception("Не удалось сохранить изменение присутствия руководителя")
-    for city_id, city, role in changed:
+        log.exception("Не удалось сохранить изменение присутствия участника города")
+
+    for city_id, city, role in leader_changes:
         label = "мэр" if role == "mayor" else "заместитель мэра"
         await _edit_review_message(bot, state, city_id, city)
         if city.get("status") == "approved":
@@ -4032,6 +4753,23 @@ async def _handle_member_presence_change(
                 f"Пользователь <@{member.id}> (`{member.id}`), должность **{label}**, "
                 f"{'снова находится на сервере' if present else 'покинул Discord-сервер'}. "
                 + ("Доступ по ID снова действует." if present else "Администрации необходимо назначить нового руководителя.")
+            ),
+            city_id=city_id,
+            city=city,
+            color=0x59B77A if present else 0xF2B84B,
+        )
+
+    for city_id, city in citizen_changes:
+        await _edit_review_message(bot, state, city_id, city)
+        if city.get("status") == "approved":
+            await sync_registry_post(bot, state, city_id, city)
+        await _send_city_log(
+            bot,
+            state,
+            title="👥 Горожанин вернулся на сервер" if present else "👥 Горожанин покинул сервер",
+            description=(
+                f"Пользователь <@{member.id}> (`{member.id}`) "
+                f"{'снова доступен на Discord-сервере' if present else 'покинул Discord-сервер, но сохранён в списке города'}."
             ),
             city_id=city_id,
             city=city,

@@ -9,6 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .components import build_framed_view
 from .unified_store import UnifiedDiscordStore, UnifiedState
 
 log = logging.getLogger("funfernus-government")
@@ -361,40 +362,54 @@ async def publish_government_panel(bot: commands.Bot, store: UnifiedDiscordStore
         "Выберите подходящее действие ниже. Администрация рассмотрит обращение и ответит вам.",
     )
     accent = int(state.options.get("accent_color", 0x19B9D1))
+    body = (
+        f"{description}\n\n"
+        "**Подготовьте перед подачей**\n"
+        "• Minecraft-ник ответчика\n"
+        "• Discord ответчика\n"
+        "• подробное описание ситуации\n"
+        "• ваши требования\n"
+        "• доказательства: скриншоты, файлы или ссылки"
+    )
 
-    embed = discord.Embed(title=title, description=description, color=accent)
+    source_view = ClaimPanelView(bot, store)
+    source_button = next(
+        item for item in source_view.children if isinstance(item, discord.ui.Button)
+    )
+    claim_button = discord.ui.Button(
+        label=source_button.label,
+        emoji=source_button.emoji,
+        style=source_button.style,
+        custom_id=source_button.custom_id,
+    )
+    claim_button.callback = source_button.callback
+    action_row = discord.ui.ActionRow()
+    action_row.add_item(claim_button)
 
     asset = state.asset("government_panel")
-    if asset.url:
-        embed.set_image(url=asset.url)
-
-    embed.add_field(
-        name="Подготовьте перед подачей",
-        value=(
-            "• Minecraft-ник ответчика\n"
-            "• Discord ответчика\n"
-            "• подробное описание ситуации\n"
-            "• ваши требования\n"
-            "• доказательства: скриншоты, файлы, ссылки"
-        ),
-        inline=False,
+    layout = build_framed_view(
+        title=title,
+        body=body,
+        banner_url=asset.url,
+        color=accent,
+        footer=state.texts.get("government_footer", "FunFernus • Правительство"),
+        action_row=action_row,
+        timeout=None,
     )
-    embed.set_footer(text=state.texts.get("government_footer", "FunFernus • Правительство"))
 
-    view = ClaimPanelView(bot, store)
     old = state.messages.get("government_panel", 0)
     if old:
         try:
             message = await channel.fetch_message(old)
-            await message.edit(content=None, embed=embed, attachments=[], view=view)
-            return True, "Панель правительства обновлена."
+            await message.edit(content=None, embeds=[], attachments=[], view=layout)
+            return True, "Панель правительства обновлена с большим баннером сверху."
         except discord.HTTPException:
             pass
 
-    message = await channel.send(embed=embed, view=view)
+    message = await channel.send(view=layout)
     state.messages["government_panel"] = message.id
     await store.save(state)
-    return True, "Панель правительства опубликована."
+    return True, "Панель правительства опубликована с большим баннером сверху."
 
 
 class GovernmentBannerModal(discord.ui.Modal):
@@ -404,7 +419,7 @@ class GovernmentBannerModal(discord.ui.Modal):
         self.store = store
         self.file_label = discord.ui.Label(
             text="Файл баннера",
-            description="PNG, JPG, JPEG, WEBP или GIF, до 10 МБ.",
+            description="PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1200×630 или 1600×840.",
             component=discord.ui.FileUpload(custom_id="government_banner", required=True, min_values=1, max_values=1),
         )
         self.add_item(self.file_label)
@@ -419,10 +434,17 @@ class GovernmentBannerModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True, thinking=True)
         state = self.store.get(interaction.guild.id)
         if state is None:
+            await interaction.edit_original_response(content="❌ Состояние не загружено.")
             return
-        await self.store.replace_asset(interaction.guild, state, "government_panel", image, "Панель правительства")
-        await publish_government_panel(self.bot, self.store, interaction.guild, state)
-        await interaction.followup.send("✅ Баннер сохранён и панель обновлена.", ephemeral=True)
+        try:
+            await self.store.replace_asset(interaction.guild, state, "government_panel", image, "Панель правительства")
+            ok, text = await publish_government_panel(self.bot, self.store, interaction.guild, state)
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"❌ Баннер не обновлён: `{exc}`")
+            return
+        await interaction.edit_original_response(
+            content=("✅ " if ok else "⚠️ ") + text
+        )
 
 
 class GovernmentChannelSelect(discord.ui.ChannelSelect):

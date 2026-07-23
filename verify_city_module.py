@@ -46,6 +46,14 @@ required_fragments = (
     'on_member_remove',
     'on_member_update',
     'WARNING_COOLDOWN_SECONDS',
+    'city_management_banner_path',
+    'edit_original_response',
+    'build_framed_view',
+    'MAX_CITY_CITIZENS',
+    '"citizenIds"',
+    'CityCitizenAddSelect',
+    'CityCitizenRemoveView',
+    'CityCitizenListView',
 )
 for fragment in required_fragments:
     if fragment not in source:
@@ -61,7 +69,7 @@ for name in sorted(required_banners):
     if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
         raise SystemExit(f"ERROR: {name} не является корректным PNG.")
     width, height = struct.unpack(">II", data[16:24])
-    if width < 1000 or height < 350:
+    if width < 1000 or height < 600:
         raise SystemExit(f"ERROR: {name} слишком маленький: {width}x{height}.")
 
 requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")

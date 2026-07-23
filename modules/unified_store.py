@@ -52,6 +52,9 @@ class UnifiedState:
         "city_registry": 0,
         "city_management": 0,
         "city_logs": 0,
+        "welcome_application": 0,
+        "welcome_rules": 0,
+        "welcome_news": 0,
     })
     roles: dict[str, list[int]] = field(default_factory=lambda: {
         "support_staff": [],
@@ -90,6 +93,7 @@ class UnifiedState:
         "welcome_delay": 2,
         "city_allowed_bot_ids": [],
         "city_application_banner_path": "",
+        "city_management_banner_path": "",
     })
     counters: dict[str, int] = field(default_factory=lambda: {
         "ticket": 0,

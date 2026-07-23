@@ -115,7 +115,7 @@ class PublicationModal(discord.ui.Modal):
         )
         self.banner_field = discord.ui.Label(
             text="Баннер",
-            description="Широкий баннер PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1600×600.",
+            description="Широкий баннер PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1200×630 или 1600×840.",
             component=discord.ui.FileUpload(custom_id="publication_banner", required=True, min_values=1, max_values=1),
         )
         for item in (self.title_field, self.body_field, self.color_field, self.footer_field, self.banner_field):
@@ -883,7 +883,7 @@ class BannerUploadModal(discord.ui.Modal):
         self.label = label
         self.file_label = discord.ui.Label(
             text="Файл баннера",
-            description="Широкий баннер PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1600×600.",
+            description="Широкий баннер PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1200×630 или 1600×840.",
             component=discord.ui.FileUpload(custom_id=f"banner_{key}", required=True, min_values=1, max_values=1),
         )
         self.add_item(self.file_label)
@@ -898,16 +898,18 @@ class BannerUploadModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True, thinking=True)
         state = self.store.get(interaction.guild.id)
         if state is None:
-            await interaction.followup.send("Состояние не загружено.", ephemeral=True)
+            await interaction.edit_original_response(content="❌ Состояние не загружено.")
             return
         try:
             await self.store.replace_asset(interaction.guild, state, self.key, image, self.label)
         except Exception as exc:
-            await interaction.followup.send(f"❌ Ошибка сохранения: `{exc}`", ephemeral=True)
+            await interaction.edit_original_response(content=f"❌ Ошибка сохранения: `{exc}`")
             return
         if self.key == "support_panel":
             await publish_support_panel(self.bot, self.store, interaction.guild, state)
-        await interaction.followup.send("✅ Баннер сохранён в Discord и будет загружаться после перезапуска.", ephemeral=True)
+        await interaction.edit_original_response(
+            content="✅ Баннер сохранён. Индикатор загрузки закрыт, изменения применены."
+        )
 
 
 class CommunityChannelSelect(discord.ui.ChannelSelect):
@@ -1011,6 +1013,39 @@ class CommunityPanelTextModal(discord.ui.Modal):
         )
 
 
+class WelcomeLinkChannelSelect(discord.ui.ChannelSelect):
+    def __init__(
+        self,
+        store: UnifiedDiscordStore,
+        key: str,
+        placeholder: str,
+        channel_types: list[discord.ChannelType],
+    ) -> None:
+        super().__init__(
+            placeholder=placeholder,
+            channel_types=channel_types,
+            min_values=1,
+            max_values=1,
+        )
+        self.store = store
+        self.key = key
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        if state is None:
+            await interaction.response.send_message("❌ Состояние не загружено.", ephemeral=True)
+            return
+        channel = self.values[0]
+        state.channels[self.key] = channel.id
+        await self.store.save(state)
+        await interaction.response.send_message(
+            f"✅ Ссылка приветствия сохранена: {channel.mention}",
+            ephemeral=True,
+        )
+
+
 class CommunitySetupView(discord.ui.View):
     def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
         super().__init__(timeout=900)
@@ -1053,6 +1088,39 @@ class CommunitySetupView(discord.ui.View):
     @discord.ui.button(label="Баннер приветствия", emoji="👋", style=discord.ButtonStyle.primary)
     async def welcome_banner(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(BannerUploadModal(self.bot, self.store, "welcome", "Приветствие"))
+
+    @discord.ui.button(label="Кнопки приветствия", emoji="🔗", style=discord.ButtonStyle.secondary)
+    async def welcome_links(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = discord.ui.View(timeout=600)
+        view.add_item(
+            WelcomeLinkChannelSelect(
+                self.store,
+                "welcome_application",
+                "Канал подачи анкеты",
+                [discord.ChannelType.text, discord.ChannelType.news],
+            )
+        )
+        view.add_item(
+            WelcomeLinkChannelSelect(
+                self.store,
+                "welcome_rules",
+                "Форум с правилами",
+                [discord.ChannelType.forum],
+            )
+        )
+        view.add_item(
+            WelcomeLinkChannelSelect(
+                self.store,
+                "welcome_news",
+                "Канал или форум новостей",
+                [discord.ChannelType.text, discord.ChannelType.news, discord.ChannelType.forum],
+            )
+        )
+        await interaction.response.send_message(
+            "Выберите три места, на которые будут вести кнопки в приветственном письме:",
+            view=view,
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Опубликовать панель", emoji="🚀", style=discord.ButtonStyle.success)
     async def publish(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1126,6 +1194,9 @@ async def setup_community(bot: commands.Bot, store: UnifiedDiscordStore, admin_i
         support_panel_label = f"<#{support_panel_id}>" if support_panel_id else "не выбрана"
         support_review_label = f"<#{support_review_id}>" if support_review_id else "не выбрано"
 
+        welcome_application = state.channels.get("welcome_application", 0)
+        welcome_rules = state.channels.get("welcome_rules", 0)
+        welcome_news = state.channels.get("welcome_news", 0)
         embed = discord.Embed(
             title="⚙️ Настройка сообщества",
             description=(
@@ -1134,6 +1205,15 @@ async def setup_community(bot: commands.Bot, store: UnifiedDiscordStore, admin_i
                 "Баннеры загружаются файлами и сохраняются служебными сообщениями в config-канале."
             ),
             color=int(state.options.get("accent_color", 0x19B9D1)),
+        )
+        embed.add_field(
+            name="Кнопки приветственного письма",
+            value=(
+                f"Подать анкету: {f'<#{welcome_application}>' if welcome_application else 'автоматически из основной панели'}\n"
+                f"Правила: {f'<#{welcome_rules}>' if welcome_rules else 'не выбраны'}\n"
+                f"Новости: {f'<#{welcome_news}>' if welcome_news else 'не выбраны'}"
+            ),
+            inline=False,
         )
         await interaction.response.send_message(embed=embed, view=CommunitySetupView(bot, store), ephemeral=True)
 
@@ -1147,15 +1227,41 @@ async def setup_community(bot: commands.Bot, store: UnifiedDiscordStore, admin_i
         delay = min(int(state.options.get("welcome_delay", 2) or 0), 60)
         if delay:
             await asyncio.sleep(delay)
-        embed = discord.Embed(
-            title=state.texts.get("welcome_title", "Добро пожаловать!"),
-            description=state.texts.get("welcome_text", "Рады видеть вас на сервере."),
-            color=int(state.options.get("accent_color", 0x19B9D1)),
-        )
+        application_id = int(state.channels.get("welcome_application", 0) or 0)
+        if not application_id:
+            settings_store = getattr(bot, "settings_store", None)
+            settings = settings_store.get_settings(member.guild.id) if settings_store else None
+            application_id = int(getattr(settings, "panel_channel_id", 0) or 0)
+
+        links = [
+            ("📋 Подать анкету", application_id),
+            ("📖 Правила", int(state.channels.get("welcome_rules", 0) or 0)),
+            ("📰 Новости сервера", int(state.channels.get("welcome_news", 0) or 0)),
+        ]
+        action_row = discord.ui.ActionRow()
+        has_links = False
+        for label, channel_id in links:
+            if channel_id:
+                has_links = True
+                action_row.add_item(
+                    discord.ui.Button(
+                        label=label,
+                        style=discord.ButtonStyle.link,
+                        url=f"https://discord.com/channels/{member.guild.id}/{channel_id}",
+                    )
+                )
+
         asset = state.asset("welcome")
-        if asset.url:
-            embed.set_image(url=asset.url)
+        view = build_framed_view(
+            title=state.texts.get("welcome_title", "Добро пожаловать!"),
+            body=state.texts.get("welcome_text", "Рады видеть вас на сервере."),
+            banner_url=asset.url,
+            color=int(state.options.get("accent_color", 0x19B9D1)),
+            footer="FunFernus • Приветствие",
+            action_row=action_row if has_links else None,
+            timeout=None,
+        )
         try:
-            await member.send(embed=embed)
+            await member.send(view=view)
         except discord.HTTPException:
             pass
