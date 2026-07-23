@@ -15,7 +15,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .components import build_framed_view
 from .unified_store import AssetRef, UnifiedDiscordStore, UnifiedState
 
 log = logging.getLogger("funfernus-cities")
@@ -42,6 +41,31 @@ STATIC_BANNERS: dict[str, str] = {
     "leadership": "city_leadership.png",
     "logs": "city_logs.png",
     "setup": "city_setup.png",
+}
+
+
+BANNER_OPTION_KEYS: dict[str, str] = {
+    "application": "city_application_banner_path",
+    "moderation": "city_moderation_banner_path",
+    "registry": "city_registry_banner_path",
+    "management": "city_management_banner_path",
+    "notification": "city_notification_banner_path",
+    "warning": "city_warning_banner_path",
+    "leadership": "city_leadership_banner_path",
+    "logs": "city_logs_banner_path",
+    "setup": "city_setup_banner_path",
+}
+
+BANNER_LABELS: dict[str, str] = {
+    "application": "панель подачи заявок",
+    "moderation": "карточки модерации",
+    "registry": "карточка реестра городов",
+    "management": "панель управления городом",
+    "notification": "информационные уведомления",
+    "warning": "предупреждения и ошибки",
+    "leadership": "сообщения о смене руководства",
+    "logs": "лог-сообщения",
+    "setup": "панель настройки городов",
 }
 
 _city_locks: dict[tuple[int, str], asyncio.Lock] = {}
@@ -319,13 +343,9 @@ def _city_custom_banner_path(city: dict[str, Any]) -> Path | None:
 
 
 def _banner_path(kind: str, city: dict[str, Any] | None = None, state: UnifiedState | None = None) -> Path:
-    if state is not None and city is None and kind in {"application", "management"}:
-        option_key = (
-            "city_application_banner_path"
-            if kind == "application"
-            else "city_management_banner_path"
-        )
-        custom = str(state.options.get(option_key, "") or "").strip()
+    if state is not None and city is None:
+        option_key = BANNER_OPTION_KEYS.get(kind, "")
+        custom = str(state.options.get(option_key, "") or "").strip() if option_key else ""
         if custom:
             path = _resolve_project_path(custom)
             if path.is_file():
@@ -1302,7 +1322,7 @@ async def sync_registry_post(
             embed=city_registry_embed(city_id, city, state),
             state=state,
             city=city,
-            content=f"`{city_id}` • Официальная карточка города FunFernus",
+            content=None,
         )
         screenshot_message, screenshot_text = await _edit_screenshot_message(
             thread,
@@ -1357,7 +1377,7 @@ async def create_registry_post(
     try:
         created = await forum.create_thread(
             name=str(city.get("name", city_id))[:100],
-            content=f"`{city_id}` • Официальная карточка города FunFernus",
+            content=None,
             embeds=embeds,
             file=banner_file,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -3898,29 +3918,21 @@ async def _publish_city_panels_locked(
 
     accent = int(state.options.get("accent_color", 0x19B9D1))
 
-    def panel_payload(kind: str) -> tuple[discord.ui.LayoutView, discord.File]:
+    def panel_payload(kind: str) -> tuple[list[discord.Embed], discord.File, discord.ui.View]:
+        accent = int(state.options.get("accent_color", 0x19B9D1))
         if kind == "application":
-            title = str(state.texts.get("city_application_title", "Регистрация города FunFernus"))
+            title = "🏰 Регистрация города"
             body = (
-                str(
-                    state.texts.get(
-                        "city_application_description",
-                        "Нажмите кнопку ниже, выберите мэра и заместителя, затем заполните данные города.",
-                    )
-                )
-                + "\n\n**Как проходит регистрация**\n"
-                + "• Выбор мэра и заместителя через меню пользователей Discord.\n"
-                + "• Заполнение названия, стиля, координат и описания.\n"
-                + "• Загрузка настоящих файлов скриншотов.\n"
-                + "• Рассмотрение администрацией и публикация в реестре."
+                "Заполните заявку на регистрацию города и укажите руководство, стиль, координаты, описание, "
+                "а также первые скриншоты построек. После отправки заявка попадёт в закрытый канал администрации."
             )
-            footer = str(state.texts.get("city_application_footer", "FunFernus • Реестр городов"))
-            source_view = CityApplicationPanelView(bot, store)
+            footer = "FunFernus • Подача заявок на регистрацию города"
+            source_view = CityApplicationLauncherView(bot, store)
         else:
             title = "⚙️ Управление зарегистрированным городом"
             body = (
                 "Бот определяет город по вашему Discord ID. Через панель можно менять название, описание, "
-                "главный баннер, координаты и архитектурный стиль.\n\n"
+                "главный баннер, координаты, архитектурный стиль, руководство и список горожан.\n\n"
                 "**Безопасность**\n"
                 "• Права не зависят от ника.\n"
                 "• Руководство меняет только настроенная администрация.\n"
@@ -3929,9 +3941,7 @@ async def _publish_city_panels_locked(
             footer = "FunFernus • Управление городом"
             source_view = CityManagementLauncherView(bot, store)
 
-        source_button = next(
-            item for item in source_view.children if isinstance(item, discord.ui.Button)
-        )
+        source_button = next(item for item in source_view.children if isinstance(item, discord.ui.Button))
         button = discord.ui.Button(
             label=source_button.label,
             emoji=source_button.emoji,
@@ -3939,22 +3949,19 @@ async def _publish_city_panels_locked(
             custom_id=source_button.custom_id,
         )
         button.callback = source_button.callback
-        action_row = discord.ui.ActionRow()
-        action_row.add_item(button)
 
-        path = _banner_path(kind, state=state)
-        suffix = path.suffix.lower() if path.suffix.lower() in IMAGE_EXTENSIONS else ".png"
-        filename = f"funfernus_city_{kind}_panel{suffix}"
-        layout = build_framed_view(
+        view = discord.ui.View(timeout=None)
+        view.add_item(button)
+
+        content_embed = discord.Embed(
             title=title,
-            body=body,
-            banner_url=f"attachment://{filename}",
+            description=body,
             color=accent,
-            footer=footer,
-            action_row=action_row,
-            timeout=None,
+            timestamp=datetime.now(timezone.utc),
         )
-        return layout, discord.File(path, filename=filename)
+        content_embed.set_footer(text=footer)
+        embeds, banner_file = _message_payload(kind, content_embed, state=state)
+        return embeds, banner_file, view
 
     async def upsert(
         channel: discord.TextChannel,
@@ -3962,28 +3969,26 @@ async def _publish_city_panels_locked(
         *,
         kind: str,
     ) -> discord.Message:
-        layout, banner_file = panel_payload(kind)
+        embeds, banner_file, view = panel_payload(kind)
         message_id = int(state.messages.get(key, 0) or 0)
         if message_id:
             try:
                 message = await channel.fetch_message(message_id)
                 return await message.edit(
                     content=None,
-                    embeds=[],
+                    embeds=embeds,
                     attachments=[banner_file],
-                    view=layout,
+                    view=view,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except discord.NotFound:
-                # Исходное сообщение действительно удалено — создаём его заново.
-                layout, banner_file = panel_payload(kind)
+                embeds, banner_file, view = panel_payload(kind)
             except (discord.Forbidden, discord.HTTPException):
-                # При 429/5xx нельзя сразу создавать дубликат панели. Ошибка
-                # передаётся наружу, а discord.py сам соблюдает Retry-After.
                 raise
         return await channel.send(
+            embeds=embeds,
             file=banner_file,
-            view=layout,
+            view=view,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -4038,8 +4043,8 @@ async def _publish_city_panels_locked(
         )
         return True, "Панели регистрации и управления городами опубликованы с локальными полноразмерными баннерами."
 
-    panel_name = "подачи заявок" if only_kind == "application" else "управления городом"
-    return True, f"Панель {panel_name} обновлена."
+    panel_name = BANNER_LABELS.get(only_kind or "application", "панель городов")
+    return True, f"Обновлено: {panel_name}."
 
 
 class CityPanelBannerModal(discord.ui.Modal):
@@ -4049,9 +4054,9 @@ class CityPanelBannerModal(discord.ui.Modal):
         store: UnifiedDiscordStore,
         target: str,
     ) -> None:
-        self.target = "management" if target == "management" else "application"
-        label = "управления городом" if self.target == "management" else "регистрации городов"
-        super().__init__(title=f"Баннер панели {label}", timeout=600)
+        self.target = target if target in BANNER_OPTION_KEYS else "application"
+        label = BANNER_LABELS.get(self.target, "системы городов")
+        super().__init__(title=f"Баннер: {label}", timeout=600)
         self.bot = bot
         self.store = store
         self.file_label = discord.ui.Label(
@@ -4110,11 +4115,7 @@ class CityPanelBannerModal(discord.ui.Modal):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         suffix = _safe_extension(attachment.filename, attachment.content_type or "")
-        option_key = (
-            "city_management_banner_path"
-            if self.target == "management"
-            else "city_application_banner_path"
-        )
+        option_key = BANNER_OPTION_KEYS[self.target]
         destination = STATIC_BANNER_DIR / f"custom_{self.target}{suffix}"
         previous = str(state.options.get(option_key, "") or "")
         try:
@@ -4153,12 +4154,12 @@ class CityPanelBannerModal(discord.ui.Modal):
             # Целевой канал может быть ещё не настроен. В этом случае панель
             # обновить нельзя, но путь к баннеру всё равно сохраняется.
             await self.store.save(state)
-        panel_name = "управления городом" if self.target == "management" else "подачи заявок"
+        panel_name = BANNER_LABELS.get(self.target, "системы городов")
         await _send_interaction_card(
             interaction,
             kind="notification" if ok else "warning",
             title="✅ Баннер установлен" if ok else "⚠️ Баннер сохранён",
-            description=f"Баннер панели **{panel_name}** обновлён. {text}",
+            description=f"Большой баннер для **{panel_name}** обновлён. {text}",
             state=state,
             followup=True,
             color=0x59B77A if ok else 0xF2B84B,
@@ -4333,6 +4334,33 @@ class CityAllowedBotsSelect(discord.ui.UserSelect):
         )
 
 
+class CityBannerKindSelect(discord.ui.Select):
+    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
+        self.bot = bot
+        self.store = store
+        options = [
+            discord.SelectOption(label="Подача заявок", value="application", emoji="🏰"),
+            discord.SelectOption(label="Карточки модерации", value="moderation", emoji="✅"),
+            discord.SelectOption(label="Карточка реестра", value="registry", emoji="🗂️"),
+            discord.SelectOption(label="Управление городом", value="management", emoji="⚙️"),
+            discord.SelectOption(label="Уведомления", value="notification", emoji="ℹ️"),
+            discord.SelectOption(label="Предупреждения", value="warning", emoji="⚠️"),
+            discord.SelectOption(label="Смена руководства", value="leadership", emoji="🔁"),
+            discord.SelectOption(label="Логи", value="logs", emoji="📋"),
+            discord.SelectOption(label="Панель настройки", value="setup", emoji="🛠️"),
+        ]
+        super().__init__(placeholder="Выберите любой баннер системы городов", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(CityPanelBannerModal(self.bot, self.store, self.values[0]))
+
+
+class CityBannerKindView(CityTransientView):
+    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
+        super().__init__(timeout=600)
+        self.add_item(CityBannerKindSelect(bot, store))
+
+
 class CitySetupView(discord.ui.View):
     def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
         super().__init__(timeout=900)
@@ -4440,6 +4468,18 @@ class CitySetupView(discord.ui.View):
             CityPanelBannerModal(self.bot, self.store, "management")
         )
 
+    @discord.ui.button(label="Все баннеры городов", emoji="🖼️", style=discord.ButtonStyle.primary)
+    async def other_banners(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        await _send_interaction_card(
+            interaction,
+            kind="setup",
+            title="🖼️ Все баннеры системы городов",
+            description="Выберите любой экран системы городов и загрузите для него отдельный большой локальный баннер. Каждый баннер настраивается независимо.",
+            state=state,
+            view=CityBannerKindView(self.bot, self.store),
+        )
+
     @discord.ui.button(label="Опубликовать панели", emoji="🚀", style=discord.ButtonStyle.success)
     async def publish(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.guild is None:
@@ -4476,8 +4516,7 @@ async def send_city_setup_message(
     embed = discord.Embed(
         title="⚙️ Настройка системы городов",
         description=(
-            "Настройте пять каналов, роль мэра, роли администрации, разрешённых ботов и два отдельных баннера: "
-            "для подачи заявок и для управления городом. Все изображения системы городов отправляются "
+            "Настройте пять каналов, роль мэра, роли администрации, разрешённых ботов и большие локальные баннеры для всех сообщений системы городов. Все изображения отправляются "
             "настоящими файлами через `attachment://`, без внешних URL."
         ),
         color=int(state.options.get("accent_color", 0x19B9D1)),
@@ -4511,6 +4550,12 @@ async def send_city_setup_message(
             else "Используется встроенный большой баннер"
         ),
         inline=True,
+    )
+    custom_kinds = [name for kind, name in BANNER_LABELS.items() if kind not in {"application", "management"} and state.options.get(BANNER_OPTION_KEYS[kind])]
+    embed.add_field(
+        name="Остальные системные баннеры",
+        value=("Собственные баннеры: " + ", ".join(custom_kinds)) if custom_kinds else "Используются встроенные большие баннеры",
+        inline=False,
     )
     embed.set_footer(text="FunFernus • Настройка городов")
     embeds, file = _message_payload("setup", embed, state=state)

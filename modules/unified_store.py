@@ -93,7 +93,14 @@ class UnifiedState:
         "welcome_delay": 2,
         "city_allowed_bot_ids": [],
         "city_application_banner_path": "",
+        "city_moderation_banner_path": "",
+        "city_registry_banner_path": "",
         "city_management_banner_path": "",
+        "city_notification_banner_path": "",
+        "city_warning_banner_path": "",
+        "city_leadership_banner_path": "",
+        "city_logs_banner_path": "",
+        "city_setup_banner_path": "",
     })
     counters: dict[str, int] = field(default_factory=lambda: {
         "ticket": 0,
