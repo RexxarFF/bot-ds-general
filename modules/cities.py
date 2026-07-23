@@ -207,6 +207,102 @@ def _set_citizen_absent_ids(city: dict[str, Any], values: Iterable[int]) -> None
     city["citizen_absent_ids"] = list(clean)
 
 
+def _pending_invitations(city: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = city.get("pendingInvitations", city.get("pending_invitations", []))
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen_users: set[int] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            user_id = int(item.get("userId", item.get("user_id", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0 or user_id in seen_users:
+            continue
+        status = str(item.get("status", "pending") or "pending")
+        if status != "pending":
+            continue
+        normalized = dict(item)
+        normalized["userId"] = user_id
+        normalized["user_id"] = user_id
+        normalized["status"] = "pending"
+        normalized.setdefault("invitationId", str(item.get("invitation_id", "") or secrets.token_hex(8)))
+        normalized["invitation_id"] = normalized["invitationId"]
+        normalized["dmMessageId"] = int(item.get("dmMessageId", item.get("dm_message_id", 0)) or 0)
+        normalized["dm_message_id"] = normalized["dmMessageId"]
+        normalized["invitedBy"] = int(item.get("invitedBy", item.get("invited_by", 0)) or 0)
+        normalized["invited_by"] = normalized["invitedBy"]
+        normalized.setdefault("createdAt", str(item.get("created_at", "") or _now_iso()))
+        normalized["created_at"] = normalized["createdAt"]
+        result.append(normalized)
+        seen_users.add(user_id)
+    return result
+
+
+def _set_pending_invitations(city: dict[str, Any], values: Iterable[dict[str, Any]]) -> None:
+    clean: list[dict[str, Any]] = []
+    seen_users: set[int] = set()
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        try:
+            user_id = int(item.get("userId", item.get("user_id", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0 or user_id in seen_users:
+            continue
+        normalized = dict(item)
+        normalized["userId"] = user_id
+        normalized["user_id"] = user_id
+        normalized["status"] = "pending"
+        normalized.setdefault("invitationId", str(item.get("invitation_id", "") or secrets.token_hex(8)))
+        normalized["invitation_id"] = normalized["invitationId"]
+        normalized["dmMessageId"] = int(item.get("dmMessageId", item.get("dm_message_id", 0)) or 0)
+        normalized["dm_message_id"] = normalized["dmMessageId"]
+        normalized["invitedBy"] = int(item.get("invitedBy", item.get("invited_by", 0)) or 0)
+        normalized["invited_by"] = normalized["invitedBy"]
+        normalized.setdefault("createdAt", str(item.get("created_at", "") or _now_iso()))
+        normalized["created_at"] = normalized["createdAt"]
+        clean.append(normalized)
+        seen_users.add(user_id)
+    city["pendingInvitations"] = clean
+    city["pending_invitations"] = [dict(item) for item in clean]
+
+
+def _find_pending_invitation(
+    state: UnifiedState,
+    user_id: int,
+    *,
+    message_id: int = 0,
+) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+    for city_id, city in state.cities.items():
+        if city.get("status") != "approved":
+            continue
+        for invitation in _pending_invitations(city):
+            if int(invitation.get("userId", 0)) != user_id:
+                continue
+            if message_id and int(invitation.get("dmMessageId", 0)) not in {0, message_id}:
+                continue
+            return city_id, city, invitation
+    return None
+
+
+def _pending_invitation_preview(city: dict[str, Any], *, limit: int = 10) -> str:
+    invitations = _pending_invitations(city)
+    if not invitations:
+        return "Активных приглашений нет."
+    lines = [
+        f"{index}. <@{int(item.get('userId', 0))}> — `{int(item.get('userId', 0))}`"
+        for index, item in enumerate(invitations[:limit], 1)
+    ]
+    if len(invitations) > limit:
+        lines.append(f"…и ещё **{len(invitations) - limit}**")
+    return _trim("\n".join(lines), 1024)
+
+
 def _citizen_preview(city: dict[str, Any], *, limit: int = 15) -> str:
     citizens = _citizen_ids(city)
     if not citizens:
@@ -683,8 +779,9 @@ async def _send_user_card(
     embed: discord.Embed,
     state: UnifiedState | None = None,
     city: dict[str, Any] | None = None,
+    view: discord.ui.View | None = None,
 ) -> discord.Message:
-    layout, file = _message_payload(kind, embed, city=city, state=state)
+    layout, file = _message_payload(kind, embed, city=city, state=state, controls=view)
     return await user.send(
         view=layout,
         file=file,
@@ -885,6 +982,8 @@ def _name_taken(state: UnifiedState, name: str, *, exclude: str = "") -> bool:
 
 def _normalize_city(city: dict[str, Any]) -> None:
     _set_leaders(city, _mayor_id(city), _deputy_id(city))
+    if city.get("status") == "pending" and int(city.get("applicant_id", 0) or 0):
+        _set_leaders(city, int(city.get("applicant_id", 0)), 0)
     for camel, snake in (
         ("reviewMessageId", "review_message_id"),
         ("reviewScreenshotsMessageId", "review_screenshots_message_id"),
@@ -903,13 +1002,23 @@ def _normalize_city(city: dict[str, Any]) -> None:
     city.setdefault("allowed_role_ids", list(city.get("allowedRoleIds", [])))
     _set_citizen_ids(city, _citizen_ids(city))
     _set_citizen_absent_ids(city, _citizen_absent_ids(city))
+    _set_pending_invitations(city, _pending_invitations(city))
+    invitation_history = city.get("invitationHistory", city.get("invitation_history", []))
+    if not isinstance(invitation_history, list):
+        invitation_history = []
+    city["invitationHistory"] = invitation_history
+    city["invitation_history"] = invitation_history
     history = city.get("citizenHistory", city.get("citizen_history", []))
     if not isinstance(history, list):
         history = []
     city["citizenHistory"] = history
     city["citizen_history"] = history
-    city.setdefault("mayorPresent", bool(city.get("mayor_present", True)))
-    city.setdefault("deputyPresent", bool(city.get("deputy_present", True)))
+    city.setdefault("mayorPresent", bool(city.get("mayor_present", bool(_mayor_id(city)))))
+    city.setdefault("deputyPresent", bool(city.get("deputy_present", bool(_deputy_id(city)))))
+    if not _mayor_id(city):
+        city["mayorPresent"] = False
+    if not _deputy_id(city):
+        city["deputyPresent"] = False
     city["mayor_present"] = bool(city["mayorPresent"])
     city["deputy_present"] = bool(city["deputyPresent"])
     city.setdefault("registryStatus", str(city.get("registry_status", "not_created")))
@@ -1119,7 +1228,7 @@ def city_management_embed(city_id: str, city: dict[str, Any], state: UnifiedStat
         title=f"⚙️ Управление городом • {_trim(city.get('name'), 180)}",
         description=(
             "Изменения сохраняются по Discord ID и сразу синхронизируются с официальной публикацией. "
-            "Смена мэра и заместителя доступна только администрации через отдельную панель."
+            "Мэр приглашает игроков, управляет составом города и назначает одного заместителя из принятых горожан."
         ),
         color=accent,
         timestamp=datetime.now(timezone.utc),
@@ -1134,6 +1243,11 @@ def city_management_embed(city_id: str, city: dict[str, Any], state: UnifiedStat
     embed.add_field(
         name=f"Горожане • {len(_citizen_ids(city))}",
         value=_citizen_preview(city),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"Активные приглашения • {len(_pending_invitations(city))}",
+        value=_pending_invitation_preview(city),
         inline=False,
     )
     embed.add_field(name="Публикация реестра", value=_registry_status(city), inline=False)
@@ -1311,14 +1425,22 @@ async def _audit_city_state(
     for city_id, city in state.cities.items():
         _normalize_city(city)
 
-        mayor = await _member(guild, _mayor_id(city))
-        deputy = await _member(guild, _deputy_id(city))
+        mayor_id = _mayor_id(city)
+        deputy_id = _deputy_id(city)
+        mayor = await _member(guild, mayor_id)
+        deputy = await _member(guild, deputy_id) if deputy_id else None
         presence_checks = (
-            ("mayor", mayor is not None, "мэр"),
-            ("deputy", deputy is not None, "заместитель мэра"),
+            ("mayor", mayor_id, mayor is not None, "мэр"),
+            ("deputy", deputy_id, deputy is not None if deputy_id else False, "заместитель мэра"),
         )
-        for role_key, present, role_label in presence_checks:
-            previous_present = bool(city.get(f"{role_key}Present", city.get(f"{role_key}_present", True)))
+        for role_key, leader_id, present, role_label in presence_checks:
+            previous_present = bool(city.get(f"{role_key}Present", city.get(f"{role_key}_present", bool(leader_id))))
+            if not leader_id:
+                if previous_present:
+                    city[f"{role_key}Present"] = False
+                    city[f"{role_key}_present"] = False
+                    changed = True
+                continue
             if previous_present == present:
                 continue
             city[f"{role_key}Present"] = present
@@ -1327,7 +1449,6 @@ async def _audit_city_state(
             city[stamp_key] = _now_iso()
             city[f"{role_key}_{'joined_at' if present else 'left_at'}"] = city[stamp_key]
             changed = True
-            leader_id = _mayor_id(city) if role_key == "mayor" else _deputy_id(city)
             notices.append(
                 (
                     "👤 Руководитель снова найден на сервере" if present else "⚠️ Руководитель отсутствует на сервере",
@@ -1592,144 +1713,21 @@ async def create_registry_post(
     return created.thread, created.message, screenshot_message, "Карточка реестра создана."
 
 
-class MayorSelect(discord.ui.UserSelect):
-    def __init__(self, owner: "MayorDeputyView") -> None:
-        super().__init__(placeholder="Выберите мэра", min_values=1, max_values=1, row=0)
-        self.owner = owner
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        self.owner.mayor_id = self.values[0].id
-        await interaction.response.defer()
-
-
-class DeputySelect(discord.ui.UserSelect):
-    def __init__(self, owner: "MayorDeputyView") -> None:
-        super().__init__(placeholder="Выберите заместителя мэра", min_values=1, max_values=1, row=1)
-        self.owner = owner
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        self.owner.deputy_id = self.values[0].id
-        await interaction.response.defer()
-
-
-class MayorDeputyView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore, applicant_id: int) -> None:
-        super().__init__(timeout=600)
-        self.bot = bot
-        self.store = store
-        self.applicant_id = applicant_id
-        self.mayor_id = 0
-        self.deputy_id = 0
-        self.add_item(MayorSelect(self))
-        self.add_item(DeputySelect(self))
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.applicant_id:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Форма недоступна",
-                description="Эта форма выбора руководства открыта другим пользователем.",
-            )
-            return False
-        return True
-
-    @discord.ui.button(label="Продолжить", emoji="➡️", style=discord.ButtonStyle.primary, row=2)
-    async def continue_form(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if interaction.guild is None:
-            return
-        state = self.store.get(interaction.guild.id)
-        if state is None:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Хранилище недоступно",
-                description="Служебные данные бота ещё не загружены.",
-            )
-            return
-        if not self.mayor_id or not self.deputy_id:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Руководство не выбрано",
-                description="Отдельно выберите мэра и заместителя через два меню пользователей Discord.",
-                state=state,
-            )
-            return
-        if self.mayor_id == self.deputy_id:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Нельзя выбрать одного человека",
-                description="Мэр и заместитель должны быть разными участниками сервера.",
-                state=state,
-            )
-            return
-        mayor = await _member(interaction.guild, self.mayor_id)
-        deputy = await _member(interaction.guild, self.deputy_id)
-        if mayor is None or deputy is None or mayor.bot or deputy.bot:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Некорректный выбор",
-                description="Оба руководителя должны быть обычными участниками именно этого Discord-сервера.",
-                state=state,
-            )
-            return
-        if self.mayor_id != interaction.user.id and not _is_city_staff_member(
-            interaction.user,
-            interaction.guild,
-            state,
-            getattr(self.bot, "admin_user_ids", set()),
-        ):
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Отправитель не является мэром",
-                description="Обычную заявку должен отправлять выбранный мэр. Администрация может подать её от имени игрока.",
-                state=state,
-            )
-            return
-        mayor_city = _find_person_city(state, self.mayor_id)
-        deputy_city = _find_person_city(state, self.deputy_id)
-        if mayor_city is not None:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Мэр уже состоит в городе",
-                description=f"Выбранный мэр уже связан с городом `{mayor_city[0]}` как руководитель или горожанин.",
-                state=state,
-            )
-            return
-        if deputy_city is not None:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Заместитель уже состоит в городе",
-                description=f"Выбранный заместитель уже связан с городом `{deputy_city[0]}` как руководитель или горожанин.",
-                state=state,
-            )
-            return
-        await interaction.response.send_modal(
-            CityDetailsModal(self.bot, self.store, self.applicant_id, self.mayor_id, self.deputy_id)
-        )
-
-
 class CityDetailsModal(discord.ui.Modal):
     def __init__(
         self,
         bot: commands.Bot,
         store: UnifiedDiscordStore,
         applicant_id: int,
-        mayor_id: int,
-        deputy_id: int,
     ) -> None:
         super().__init__(title="Регистрация города • данные", timeout=600)
         self.bot = bot
         self.store = store
         self.applicant_id = applicant_id
-        self.mayor_id = mayor_id
-        self.deputy_id = deputy_id
+        # Заявитель всегда является мэром. Заместитель назначается позже
+        # только из списка принятых горожан через панель управления.
+        self.mayor_id = applicant_id
+        self.deputy_id = 0
         self.name_input = discord.ui.TextInput(
             label="Название города",
             placeholder="От 1 до 20 символов",
@@ -1795,13 +1793,13 @@ class CityDetailsModal(discord.ui.Modal):
                 state=state,
             )
             return
-        occupied = _find_person_city(state, self.mayor_id) or _find_person_city(state, self.deputy_id)
+        occupied = _find_person_city(state, self.mayor_id)
         if occupied is not None:
             await _send_interaction_card(
                 interaction,
                 kind="warning",
-                title="❌ Руководитель уже состоит в городе",
-                description=f"Пока форма была открыта, один из выбранных руководителей оказался связан с городом `{occupied[0]}`.",
+                title="❌ Вы уже состоите в городе",
+                description=f"Ваш Discord ID уже связан с городом `{occupied[0]}`.",
                 state=state,
             )
             return
@@ -1906,6 +1904,9 @@ class CityScreenshotsModal(discord.ui.Modal):
                 state=state,
             )
             return
+        # Безопасная миграция незавершённых старых форм: заявитель всегда мэр,
+        # а заместитель при регистрации больше не выбирается.
+        _set_leaders(draft, interaction.user.id, 0)
         review = await _text_channel(self.bot, state.channels.get("city_review", 0))
         if review is None:
             await _send_interaction_card(
@@ -1916,18 +1917,15 @@ class CityScreenshotsModal(discord.ui.Modal):
                 state=state,
             )
             return
-        leadership_occupied = (
-            _find_person_city(state, _mayor_id(draft))
-            or _find_person_city(state, _deputy_id(draft))
-        )
-        if leadership_occupied is not None or _name_taken(state, str(draft.get("name", ""))):
+        mayor_occupied = _find_person_city(state, _mayor_id(draft))
+        if mayor_occupied is not None or _name_taken(state, str(draft.get("name", ""))):
             await _send_interaction_card(
                 interaction,
                 kind="warning",
                 title="❌ Данные уже заняты",
                 description=(
-                    "Пока форма была открыта, название стало занято либо один из руководителей "
-                    "оказался связан с другим городом."
+                    "Пока форма была открыта, название стало занято либо заявитель уже оказался "
+                    "связан с другим городом."
                 ),
                 state=state,
             )
@@ -1993,7 +1991,7 @@ class CityScreenshotsModal(discord.ui.Modal):
             "screenshots": [],
             "screenshot_assets": [],
             "mayorPresent": True,
-            "deputyPresent": True,
+            "deputyPresent": False,
             "registryStatus": "not_created",
             "registry_status": "not_created",
             "citizenIds": [],
@@ -2002,6 +2000,10 @@ class CityScreenshotsModal(discord.ui.Modal):
             "citizen_history": [],
             "citizenAbsentIds": [],
             "citizen_absent_ids": [],
+            "pendingInvitations": [],
+            "pending_invitations": [],
+            "invitationHistory": [],
+            "invitation_history": [],
         }
         city.pop("token", None)
         _set_leaders(city, _mayor_id(draft), _deputy_id(draft))
@@ -2085,8 +2087,8 @@ class CityScreenshotsModal(discord.ui.Modal):
             title="📨 Подана заявка на регистрацию города",
             description=(
                 f"Заявку отправил <@{interaction.user.id}> (`{interaction.user.id}`).\n"
-                f"Мэр: <@{_mayor_id(city)}> (`{_mayor_id(city)}`).\n"
-                f"Заместитель: <@{_deputy_id(city)}> (`{_deputy_id(city)}`).\n"
+                f"Мэр-заявитель: <@{_mayor_id(city)}> (`{_mayor_id(city)}`).\n"
+                "Заместитель при регистрации не назначается.\n"
                 f"Локально сохранено скриншотов: **{len(saved_paths)}**."
             ),
             city_id=city_id,
@@ -2139,25 +2141,27 @@ class CityApplicationPanelView(discord.ui.View):
                 state=state,
             )
             return
-        if _has_active_city(state, interaction.user.id):
+        if _has_active_city(state, interaction.user.id) or _find_person_city(state, interaction.user.id) is not None:
             await _send_interaction_card(
                 interaction,
                 kind="warning",
-                title="❌ Активный город уже существует",
-                description="У вас уже есть зарегистрированный город или заявка на рассмотрении.",
+                title="❌ Вы уже связаны с городом",
+                description="Нельзя подать новую заявку, пока ваш Discord ID связан с действующим городом или заявкой.",
                 state=state,
             )
             return
-        await _send_interaction_card(
-            interaction,
-            kind="application",
-            title="🏰 Выберите руководство города",
-            description=(
-                "Сначала отдельно выберите мэра и заместителя через User Select Menu. "
-                "Все права будут навсегда связаны с их Discord ID, а не с ником."
-            ),
-            state=state,
-            view=MayorDeputyView(self.bot, self.store, interaction.user.id),
+        member = await _member(interaction.guild, interaction.user.id)
+        if member is None or member.bot:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Не удалось определить заявителя",
+                description="Заявку может подать только обычный участник этого Discord-сервера.",
+                state=state,
+            )
+            return
+        await interaction.response.send_modal(
+            CityDetailsModal(self.bot, self.store, interaction.user.id)
         )
 
 
@@ -2252,26 +2256,24 @@ class CityReviewView(discord.ui.View):
                 return
             mayor_id = _mayor_id(city)
             deputy_id = _deputy_id(city)
-            if not mayor_id or not deputy_id or mayor_id == deputy_id:
+            if not mayor_id:
                 await _send_interaction_card(
                     interaction,
                     kind="warning",
-                    title="❌ Ошибка руководства",
-                    description="В заявке должны быть два разных Discord ID: мэр и заместитель.",
+                    title="❌ Ошибка мэра",
+                    description="В заявке отсутствует Discord ID заявителя-мэра.",
                     state=state,
                     city=city,
                     followup=True,
                 )
                 return
             mayor = await _member(interaction.guild, mayor_id)
-            deputy = await _member(interaction.guild, deputy_id)
-            if mayor is None or deputy is None:
-                missing = "мэр" if mayor is None else "заместитель"
+            if mayor is None:
                 await _send_interaction_card(
                     interaction,
                     kind="warning",
-                    title="❌ Руководитель покинул сервер",
-                    description=f"Нельзя одобрить заявку: {missing} больше не находится на Discord-сервере.",
+                    title="❌ Мэр покинул сервер",
+                    description="Нельзя одобрить заявку: заявитель больше не находится на Discord-сервере.",
                     state=state,
                     city=city,
                     followup=True,
@@ -2300,8 +2302,8 @@ class CityReviewView(discord.ui.View):
                     "active_question": {},
                     "mayorPresent": True,
                     "mayor_present": True,
-                    "deputyPresent": True,
-                    "deputy_present": True,
+                    "deputyPresent": bool(deputy_id),
+                    "deputy_present": bool(deputy_id),
                     "registryStatus": "active",
                     "registry_status": "active",
                 }
@@ -2375,7 +2377,7 @@ class CityReviewView(discord.ui.View):
                 description=(
                     f"Модератор: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
                     f"Публикация: <#{thread.id}> (`{thread.id}`).\n"
-                    f"Мэр: <@{mayor_id}>. Заместитель: <@{deputy_id}>."
+                    f"Мэр: <@{mayor_id}>. Заместитель будет назначен мэром позже из списка горожан."
                 ),
                 city_id=city_id,
                 city=city,
@@ -2391,24 +2393,11 @@ class CityReviewView(discord.ui.View):
                 color=0x59B77A,
                 footer=f"FunFernus • {city_id}",
             )
-            deputy_dm = _simple_embed(
-                "✅ Вы назначены заместителем мэра",
-                (
-                    f"Город **{city.get('name')}** зарегистрирован. Вы можете писать в его официальной "
-                    f"публикации <#{thread.id}> по своему Discord ID."
-                ),
-                color=0x59B77A,
-                footer=f"FunFernus • {city_id}",
-            )
             dm_failures: list[str] = []
             try:
                 await _send_user_card(mayor, kind="notification", embed=mayor_dm, state=state, city=city)
             except discord.HTTPException:
                 dm_failures.append("мэру")
-            try:
-                await _send_user_card(deputy, kind="notification", embed=deputy_dm, state=state, city=city)
-            except discord.HTTPException:
-                dm_failures.append("заместителю")
 
             tail = f" ЛС не доставлены: {', '.join(dm_failures)}." if dm_failures else ""
             await _send_interaction_card(
@@ -2844,7 +2833,7 @@ class CityManagementView(discord.ui.View):
             )
         )
 
-    @discord.ui.button(label="Добавить горожан", emoji="➕", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Пригласить игрока", emoji="📨", style=discord.ButtonStyle.success)
     async def add_citizens(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.store.get(interaction.guild.id) if interaction.guild else None
         city = state.cities.get(self.city_id) if state else None
@@ -2863,14 +2852,70 @@ class CityManagementView(discord.ui.View):
         await _send_interaction_card(
             interaction,
             kind="management",
-            title="➕ Добавление горожан",
+            title="📨 Приглашение в город",
             description=(
-                "Выберите участников Discord-сервера, которые состоят в вашем городе. "
-                "Мэр, заместитель, боты и участники другого города добавлены не будут."
+                "Выберите одного участника Discord-сервера. Бот отправит ему приглашение в личные сообщения. "
+                "Игрок появится в списке горожан только после самостоятельного принятия приглашения."
             ),
             state=state,
             city=city,
             view=CityCitizenAddView(self.bot, self.store, self.city_id, self.mayor_id),
+        )
+
+    @discord.ui.button(label="Приглашения", emoji="✉️", style=discord.ButtonStyle.secondary)
+    async def invitations(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None:
+            return
+        invitations = _pending_invitations(city)
+        layout, file = _message_payload(
+            "management",
+            city_invitations_embed(self.city_id, city, state),
+            city=city,
+            state=state,
+            controls=CityInvitationManagementView(
+                self.bot,
+                self.store,
+                self.city_id,
+                self.mayor_id,
+                invitations,
+            ),
+        )
+        await interaction.response.send_message(
+            view=layout,
+            file=file,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(label="Заместитель", emoji="🛡️", style=discord.ButtonStyle.primary)
+    async def deputy(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None:
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="leadership",
+            title="🛡️ Управление заместителем",
+            description=(
+                "Повысить можно только игрока, который уже принял приглашение и находится в списке горожан. "
+                "В городе может быть только один заместитель. При замене прежний заместитель вернётся в список горожан."
+            ),
+            state=state,
+            city=city,
+            view=CityDeputyManagementView(
+                self.bot,
+                self.store,
+                self.city_id,
+                self.mayor_id,
+                bool(_deputy_id(city)),
+            ),
         )
 
     @discord.ui.button(label="Удалить горожан", emoji="➖", style=discord.ButtonStyle.danger)
@@ -3094,120 +3139,403 @@ class CityCitizenListView(discord.ui.View):
         await self._show_page(interaction, self.page + 1)
 
 
+class CityInvitationView(discord.ui.View):
+    """Постоянные кнопки приглашения. Работают и после перезапуска бота."""
+
+    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.store = store
+
+    def _resolve(self, interaction: discord.Interaction) -> tuple[UnifiedState, str, dict[str, Any], dict[str, Any]] | None:
+        message_id = interaction.message.id if interaction.message else 0
+        for state in list(getattr(self.store, "_states", {}).values()):
+            found = _find_pending_invitation(state, interaction.user.id, message_id=message_id)
+            if found is not None:
+                city_id, city, invitation = found
+                return state, city_id, city, invitation
+        return None
+
+    async def _finish_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        title: str,
+        description: str,
+        state: UnifiedState,
+        city: dict[str, Any],
+        color: int,
+    ) -> None:
+        embed = _simple_embed(title, description, color=color)
+        layout, file = _message_payload("notification", embed, state=state, city=city)
+        kwargs = {
+            "content": None,
+            "embeds": [],
+            "attachments": [file],
+            "view": layout,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if interaction.response.is_done():
+            await interaction.edit_original_response(**kwargs)
+        else:
+            await interaction.response.edit_message(**kwargs)
+
+    @discord.ui.button(
+        label="Вступить в город",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="unified:cities:invitation:accept",
+    )
+    async def accept(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        resolved = self._resolve(interaction)
+        if resolved is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Приглашение недействительно",
+                description="Оно уже принято, отклонено, отменено мэром или город был удалён.",
+            )
+            return
+        state, city_id, city, invitation = resolved
+        await interaction.response.defer()
+        guild = self.bot.get_guild(state.guild_id)
+        if guild is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Сервер недоступен",
+                description="Бот временно не видит Discord-сервер города.",
+                state=state,
+                city=city,
+            )
+            return
+        member = await _member(guild, interaction.user.id)
+        if member is None or member.bot:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Вступление невозможно",
+                description="Для принятия приглашения вы должны находиться на Discord-сервере FunFernus.",
+                state=state,
+                city=city,
+            )
+            return
+        occupied = _find_person_city(state, member.id, exclude=city_id)
+        if occupied is not None:
+            invitations = [item for item in _pending_invitations(city) if int(item.get("userId", 0)) != member.id]
+            _set_pending_invitations(city, invitations)
+            await self.store.save(state)
+            await self._finish_message(
+                interaction,
+                title="❌ Вступление отменено",
+                description=f"Ваш Discord ID уже связан с другим городом `{occupied[0]}`.",
+                state=state,
+                city=city,
+                color=0xD85C5C,
+            )
+            return
+
+        previous = copy.deepcopy(city)
+        current = _citizen_ids(city)
+        if member.id not in current and member.id not in {_mayor_id(city), _deputy_id(city)}:
+            if len(current) >= MAX_CITY_CITIZENS:
+                await _send_interaction_card(
+                    interaction,
+                    kind="warning",
+                    title="❌ В городе нет свободных мест",
+                    description=f"Достигнут лимит **{MAX_CITY_CITIZENS}** горожан.",
+                    state=state,
+                    city=city,
+                )
+                return
+            _set_citizen_ids(city, [*current, member.id])
+        _set_pending_invitations(
+            city,
+            [item for item in _pending_invitations(city) if int(item.get("userId", 0)) != member.id],
+        )
+        history = city.setdefault("invitationHistory", city.get("invitation_history", []))
+        history.append(
+            {
+                "action": "accepted",
+                "userId": member.id,
+                "invitedBy": int(invitation.get("invitedBy", 0)),
+                "changedAt": _now_iso(),
+            }
+        )
+        city["invitation_history"] = history
+        citizen_history = city.setdefault("citizenHistory", city.get("citizen_history", []))
+        citizen_history.append(
+            {"action": "join", "userIds": [member.id], "actorId": member.id, "changedAt": _now_iso()}
+        )
+        city["citizen_history"] = citizen_history
+
+        async with _lock(state.guild_id, city_id):
+            ok, sync_text = await _save_and_sync(
+                interaction,
+                self.bot,
+                self.store,
+                state,
+                city_id,
+                city,
+                previous,
+            )
+        if not ok:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Вступление не сохранено",
+                description=sync_text,
+                state=state,
+                city=previous,
+            )
+            return
+        await _send_city_log(
+            self.bot,
+            state,
+            title="✅ Игрок принял приглашение в город",
+            description=(
+                f"Игрок: <@{member.id}> (`{member.id}`).\n"
+                f"Пригласил: <@{int(invitation.get('invitedBy', 0))}>.\n"
+                f"Теперь обычных горожан: **{len(_citizen_ids(city))}**.\n"
+                f"Синхронизация: {sync_text}"
+            ),
+            city_id=city_id,
+            city=city,
+            color=0x59B77A,
+        )
+        await self._finish_message(
+            interaction,
+            title="✅ Вы вступили в город",
+            description=f"Вы приняты в **{city.get('name', city_id)}** (`{city_id}`).",
+            state=state,
+            city=city,
+            color=0x59B77A,
+        )
+
+    @discord.ui.button(
+        label="Отклонить",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+        custom_id="unified:cities:invitation:decline",
+    )
+    async def decline(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        resolved = self._resolve(interaction)
+        if resolved is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Приглашение недействительно",
+                description="Оно уже обработано или отменено.",
+            )
+            return
+        state, city_id, city, invitation = resolved
+        await interaction.response.defer()
+        previous = copy.deepcopy(city)
+        _set_pending_invitations(
+            city,
+            [item for item in _pending_invitations(city) if int(item.get("userId", 0)) != interaction.user.id],
+        )
+        history = city.setdefault("invitationHistory", city.get("invitation_history", []))
+        history.append(
+            {
+                "action": "declined",
+                "userId": interaction.user.id,
+                "invitedBy": int(invitation.get("invitedBy", 0)),
+                "changedAt": _now_iso(),
+            }
+        )
+        city["invitation_history"] = history
+        try:
+            await self.store.save(state)
+        except Exception as exc:
+            state.cities[city_id] = previous
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Ответ не сохранён",
+                description=f"Хранилище вернуло ошибку: `{exc}`",
+                state=state,
+                city=previous,
+            )
+            return
+        await _send_city_log(
+            self.bot,
+            state,
+            title="❌ Игрок отклонил приглашение",
+            description=f"Игрок: <@{interaction.user.id}> (`{interaction.user.id}`).",
+            city_id=city_id,
+            city=city,
+            color=0xD85C5C,
+        )
+        await self._finish_message(
+            interaction,
+            title="Приглашение отклонено",
+            description=f"Вы отказались вступать в **{city.get('name', city_id)}**.",
+            state=state,
+            city=city,
+            color=0xD85C5C,
+        )
+
+
 class CityCitizenAddSelect(discord.ui.UserSelect):
     def __init__(
         self,
         bot: commands.Bot,
         store: UnifiedDiscordStore,
         city_id: str,
-        mayor_id: int,
+        actor_id: int,
     ) -> None:
         super().__init__(
-            placeholder="Выберите новых горожан",
+            placeholder="Выберите игрока для приглашения",
             min_values=1,
-            max_values=10,
+            max_values=1,
         )
         self.bot = bot
         self.store = store
         self.city_id = city_id
-        self.mayor_id = mayor_id
+        self.actor_id = actor_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        state, city = await _management_guard(interaction, self.store, self.city_id, self.mayor_id)
+        state, city = await _management_guard(interaction, self.store, self.city_id, self.actor_id)
         if state is None or city is None or interaction.guild is None:
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        current = _citizen_ids(city)
-        added: list[int] = []
-        skipped: list[str] = []
-
-        for selected in self.values:
-            member = await _member(interaction.guild, selected.id)
-            if member is None:
-                skipped.append(f"`{selected.id}` — не найден на сервере")
-                continue
-            if member.bot:
-                skipped.append(f"<@{member.id}> — ботов нельзя добавлять")
-                continue
-            if member.id in {_mayor_id(city), _deputy_id(city)}:
-                skipped.append(f"<@{member.id}> — уже входит в руководство")
-                continue
-            if member.id in current or member.id in added:
-                skipped.append(f"<@{member.id}> — уже состоит в городе")
-                continue
-            other = _find_person_city(state, member.id, exclude=self.city_id)
-            if other is not None:
-                skipped.append(f"<@{member.id}> — уже состоит в городе `{other[0]}`")
-                continue
-            if len(current) + len(added) >= MAX_CITY_CITIZENS:
-                skipped.append(f"<@{member.id}> — достигнут лимит города")
-                continue
-            added.append(member.id)
-
-        if not added:
-            details = "\n".join(skipped[:10]) or "Подходящие участники не выбраны."
+        member = await _member(interaction.guild, self.values[0].id)
+        if member is None or member.bot:
             await _send_interaction_card(
                 interaction,
                 kind="warning",
-                title="❌ Никого не удалось добавить",
-                description=_trim(details, 1800),
+                title="❌ Игрок недоступен",
+                description="Выберите обычного участника этого Discord-сервера.",
+                state=state,
+                city=city,
+            )
+            return
+        if member.id in {_mayor_id(city), _deputy_id(city)} or member.id in _citizen_ids(city):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Игрок уже состоит в городе",
+                description="Этот Discord ID уже входит в руководство или список горожан.",
+                state=state,
+                city=city,
+            )
+            return
+        other = _find_person_city(state, member.id, exclude=self.city_id)
+        if other is not None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Игрок состоит в другом городе",
+                description=f"Его Discord ID уже связан с городом `{other[0]}`.",
+                state=state,
+                city=city,
+            )
+            return
+        existing_invite = _find_pending_invitation(state, member.id)
+        if existing_invite is not None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Приглашение уже отправлено",
+                description=f"У игрока уже есть активное приглашение от города `{existing_invite[0]}`.",
+                state=state,
+                city=city,
+            )
+            return
+        if len(_pending_invitations(city)) >= 25:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Слишком много активных приглашений",
+                description="Сначала отмените или дождитесь ответа по существующим приглашениям. Одновременно доступно не более **25**.",
+                state=state,
+                city=city,
+            )
+            return
+        if len(_citizen_ids(city)) >= MAX_CITY_CITIZENS:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Достигнут лимит горожан",
+                description=f"В городе уже находится **{MAX_CITY_CITIZENS}** обычных горожан.",
+                state=state,
+                city=city,
+            )
+            return
+
+        invitation = {
+            "invitationId": secrets.token_hex(8),
+            "userId": member.id,
+            "invitedBy": interaction.user.id,
+            "createdAt": _now_iso(),
+            "dmMessageId": 0,
+            "status": "pending",
+        }
+        invite_embed = _simple_embed(
+            "🏰 Приглашение в город",
+            (
+                f"Вас приглашают вступить в город **{city.get('name', self.city_id)}** (`{self.city_id}`).\n\n"
+                f"**Мэр:** <@{_mayor_id(city)}>\n"
+                f"**Приглашение отправил:** <@{interaction.user.id}>\n\n"
+                "Вы станете горожанином только после нажатия кнопки **«Вступить в город»**."
+            ),
+            color=0x5865F2,
+            footer=f"FunFernus • Приглашение • {self.city_id}",
+        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        dm_message: discord.Message | None = None
+        try:
+            dm_message = await _send_user_card(
+                member,
+                kind="notification",
+                embed=invite_embed,
+                state=state,
+                city=city,
+                view=CityInvitationView(self.bot, self.store),
+            )
+            invitation["dmMessageId"] = dm_message.id
+            invitations = _pending_invitations(city)
+            invitations.append(invitation)
+            _set_pending_invitations(city, invitations)
+            await self.store.save(state)
+        except Exception as exc:
+            if dm_message is not None:
+                try:
+                    await dm_message.delete()
+                except discord.HTTPException:
+                    pass
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Приглашение не отправлено",
+                description=f"Проверьте, что игрок принимает личные сообщения. Ошибка: `{exc}`",
                 state=state,
                 city=city,
                 followup=True,
             )
             return
 
-        previous = copy.deepcopy(city)
-        _set_citizen_ids(city, [*current, *added])
-        _set_citizen_absent_ids(city, _citizen_absent_ids(city))
-        history = city.setdefault("citizenHistory", city.get("citizen_history", []))
-        history.append(
-            {
-                "action": "add",
-                "userIds": list(added),
-                "actorId": interaction.user.id,
-                "changedAt": _now_iso(),
-            }
+        await _send_city_log(
+            self.bot,
+            state,
+            title="📨 Отправлено приглашение в город",
+            description=(
+                f"Игрок: <@{member.id}> (`{member.id}`).\n"
+                f"Инициатор: <@{interaction.user.id}> (`{interaction.user.id}`)."
+            ),
+            city_id=self.city_id,
+            city=city,
+            color=0x5865F2,
         )
-        city["citizen_history"] = history
-        async with _lock(interaction.guild.id, self.city_id):
-            ok, sync_text = await _save_and_sync(
-                interaction,
-                self.bot,
-                self.store,
-                state,
-                self.city_id,
-                city,
-                previous,
-            )
-        if ok:
-            await _send_city_log(
-                self.bot,
-                state,
-                title="➕ Добавлены горожане",
-                description=(
-                    f"Мэр: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
-                    f"Добавлены: {', '.join(f'<@{user_id}> (`{user_id}`)' for user_id in added)}.\n"
-                    f"Теперь в списке: **{len(_citizen_ids(city))}**.\n"
-                    f"Синхронизация: {sync_text}"
-                ),
-                city_id=self.city_id,
-                city=city,
-                color=0x59B77A,
-            )
-        skipped_text = f"\n\nНе добавлены:\n{_trim(chr(10).join(skipped[:10]), 900)}" if skipped else ""
         await _send_interaction_card(
             interaction,
-            kind="notification" if ok else "warning",
-            title="✅ Горожане добавлены" if ok else "❌ Изменения не сохранены",
-            description=(
-                f"Добавлено: **{len(added)}**. Всего горожан: **{len(_citizen_ids(city))}**.\n{sync_text}"
-                f"{skipped_text}"
-            ),
+            kind="notification",
+            title="✅ Приглашение отправлено",
+            description=f"Игроку <@{member.id}> отправлено приглашение в личные сообщения. Он ещё не является горожанином.",
             state=state,
             city=city,
             followup=True,
-            color=0x59B77A if ok else 0xD85C5C,
+            color=0x59B77A,
         )
 
 
@@ -3217,10 +3545,324 @@ class CityCitizenAddView(discord.ui.View):
         bot: commands.Bot,
         store: UnifiedDiscordStore,
         city_id: str,
-        mayor_id: int,
+        actor_id: int,
     ) -> None:
         super().__init__(timeout=600)
-        self.add_item(CityCitizenAddSelect(bot, store, city_id, mayor_id))
+        self.add_item(CityCitizenAddSelect(bot, store, city_id, actor_id))
+
+
+def city_invitations_embed(
+    city_id: str,
+    city: dict[str, Any],
+    state: UnifiedState,
+) -> discord.Embed:
+    invitations = _pending_invitations(city)
+    embed = discord.Embed(
+        title=f"📨 Приглашения • {_trim(city.get('name'), 180)}",
+        description=(
+            "Игрок становится горожанином только после самостоятельного принятия приглашения в личных сообщениях. "
+            "До этого он не получает никаких прав города."
+        ),
+        color=int(state.options.get("accent_color", 0x19B9D1)),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name=f"Активные приглашения • {len(invitations)}", value=_pending_invitation_preview(city), inline=False)
+    embed.set_footer(text=f"FunFernus • {city_id} • Управление приглашениями")
+    return embed
+
+
+class CityInvitationCancelSelect(discord.ui.Select):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        actor_id: int,
+        invitations: list[dict[str, Any]],
+    ) -> None:
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.actor_id = actor_id
+        options = [
+            discord.SelectOption(
+                label=_trim(f"Пользователь {int(item.get('userId', 0))}", 90),
+                value=str(int(item.get("userId", 0))),
+                description=_trim(f"Отменить приглашение • ID {int(item.get('userId', 0))}", 100),
+            )
+            for item in invitations[:25]
+        ]
+        super().__init__(
+            placeholder="Выберите приглашения для отмены",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        state, city = await _management_guard(interaction, self.store, self.city_id, self.actor_id)
+        if state is None or city is None:
+            return
+        remove_ids = {int(value) for value in self.values if str(value).isdigit()}
+        invitations = _pending_invitations(city)
+        removed = [item for item in invitations if int(item.get("userId", 0)) in remove_ids]
+        if not removed:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Приглашения уже недействительны",
+                description="Выбранные приглашения были обработаны ранее.",
+                state=state,
+                city=city,
+            )
+            return
+        previous = copy.deepcopy(city)
+        _set_pending_invitations(
+            city,
+            [item for item in invitations if int(item.get("userId", 0)) not in remove_ids],
+        )
+        history = city.setdefault("invitationHistory", city.get("invitation_history", []))
+        for item in removed:
+            history.append(
+                {
+                    "action": "cancelled",
+                    "userId": int(item.get("userId", 0)),
+                    "actorId": interaction.user.id,
+                    "changedAt": _now_iso(),
+                }
+            )
+        city["invitation_history"] = history
+        try:
+            await self.store.save(state)
+        except Exception as exc:
+            state.cities[self.city_id] = previous
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Отмена не сохранена",
+                description=f"Хранилище вернуло ошибку: `{exc}`",
+                state=state,
+                city=previous,
+            )
+            return
+        await _send_city_log(
+            self.bot,
+            state,
+            title="🚫 Отменены приглашения в город",
+            description=(
+                f"Инициатор: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+                f"Отменены для: {', '.join(f'<@{int(item.get("userId", 0))}>' for item in removed)}."
+            ),
+            city_id=self.city_id,
+            city=city,
+            color=0xF2B84B,
+        )
+        await _send_interaction_card(
+            interaction,
+            kind="notification",
+            title="✅ Приглашения отменены",
+            description=f"Отменено приглашений: **{len(removed)}**.",
+            state=state,
+            city=city,
+            color=0x59B77A,
+        )
+
+
+class CityInvitationManagementView(discord.ui.View):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        actor_id: int,
+        invitations: list[dict[str, Any]],
+    ) -> None:
+        super().__init__(timeout=600)
+        if invitations:
+            self.add_item(CityInvitationCancelSelect(bot, store, city_id, actor_id, invitations))
+
+
+async def _set_deputy_from_citizen(
+    interaction: discord.Interaction,
+    bot: commands.Bot,
+    store: UnifiedDiscordStore,
+    state: UnifiedState,
+    city_id: str,
+    city: dict[str, Any],
+    *,
+    new_deputy_id: int,
+) -> tuple[bool, str]:
+    guild = interaction.guild
+    if guild is None:
+        return False, "Discord-сервер недоступен."
+    old_deputy_id = _deputy_id(city)
+    if new_deputy_id == old_deputy_id:
+        return False, "Этот игрок уже является заместителем."
+    if new_deputy_id:
+        if new_deputy_id not in _citizen_ids(city):
+            return False, "Повысить можно только игрока, который уже принял приглашение и находится в списке горожан."
+        member = await _member(guild, new_deputy_id)
+        if member is None or member.bot:
+            return False, "Выбранный горожанин больше не находится на сервере или является ботом."
+
+    previous = copy.deepcopy(city)
+    citizens = _citizen_ids(city)
+    if old_deputy_id and old_deputy_id != new_deputy_id:
+        if old_deputy_id not in citizens and old_deputy_id != _mayor_id(city):
+            citizens.append(old_deputy_id)
+    citizens = [user_id for user_id in citizens if user_id != new_deputy_id]
+    _set_leaders(city, _mayor_id(city), new_deputy_id)
+    _set_citizen_ids(city, citizens)
+    absent = _citizen_absent_ids(city)
+    absent.discard(new_deputy_id)
+    if old_deputy_id and old_deputy_id != new_deputy_id:
+        old_member = await _member(guild, old_deputy_id)
+        if old_member is None:
+            absent.add(old_deputy_id)
+        else:
+            absent.discard(old_deputy_id)
+    _set_citizen_absent_ids(city, absent)
+    city["deputyPresent"] = bool(new_deputy_id)
+    city["deputy_present"] = bool(new_deputy_id)
+    city["deputyChangedAt"] = _now_iso()
+    city["deputy_changed_at"] = city["deputyChangedAt"]
+    history = city.setdefault("leadershipHistory", city.get("leadership_history", []))
+    history.append(
+        {
+            "type": "deputy",
+            "oldId": old_deputy_id,
+            "newId": new_deputy_id,
+            "moderatorId": interaction.user.id,
+            "changedAt": _now_iso(),
+            "source": "mayor_management" if interaction.user.id == _mayor_id(city) else "admin_management",
+        }
+    )
+    city["leadership_history"] = history
+    _refresh_allowed_writers(
+        guild,
+        state,
+        city,
+        getattr(bot, "admin_user_ids", set()),
+        bot.user.id if bot.user else 0,
+    )
+    async with _lock(state.guild_id, city_id):
+        ok, sync_text = await _save_and_sync(
+            interaction,
+            bot,
+            store,
+            state,
+            city_id,
+            city,
+            previous,
+        )
+    if not ok:
+        return False, sync_text
+    await _send_leadership_service_message(
+        bot,
+        state,
+        city_id,
+        city,
+        leader_type="deputy",
+        old_id=old_deputy_id,
+        new_id=new_deputy_id,
+        moderator_id=interaction.user.id,
+    )
+    await _send_city_log(
+        bot,
+        state,
+        title="🛡️ Изменён заместитель мэра",
+        description=(
+            f"Старый заместитель: {f'<@{old_deputy_id}> (`{old_deputy_id}`)' if old_deputy_id else 'не был назначен'}.\n"
+            f"Новый заместитель: {f'<@{new_deputy_id}> (`{new_deputy_id}`)' if new_deputy_id else 'не назначен'}.\n"
+            f"Действие выполнил: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+            f"Синхронизация: {sync_text}"
+        ),
+        city_id=city_id,
+        city=city,
+        color=0x5865F2,
+    )
+    return True, sync_text
+
+
+class CityDeputyCandidateSelect(discord.ui.UserSelect):
+    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore, city_id: str, actor_id: int) -> None:
+        super().__init__(placeholder="Выберите горожанина для повышения", min_values=1, max_values=1)
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.actor_id = actor_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        state, city = await _management_guard(interaction, self.store, self.city_id, self.actor_id)
+        if state is None or city is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, text = await _set_deputy_from_citizen(
+            interaction,
+            self.bot,
+            self.store,
+            state,
+            self.city_id,
+            city,
+            new_deputy_id=self.values[0].id,
+        )
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Заместитель назначен" if ok else "❌ Повышение не выполнено",
+            description=text,
+            state=state,
+            city=city,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
+
+
+class CityDeputyManagementView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore, city_id: str, actor_id: int, has_deputy: bool) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.actor_id = actor_id
+        self.add_item(CityDeputyCandidateSelect(bot, store, city_id, actor_id))
+        self.demote.disabled = not has_deputy
+
+    @discord.ui.button(label="Снять заместителя", emoji="⬇️", style=discord.ButtonStyle.danger, row=1)
+    async def demote(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state, city = await _management_guard(interaction, self.store, self.city_id, self.actor_id)
+        if state is None or city is None:
+            return
+        if not _deputy_id(city):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Заместитель не назначен",
+                description="Снимать с должности сейчас некого.",
+                state=state,
+                city=city,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, text = await _set_deputy_from_citizen(
+            interaction,
+            self.bot,
+            self.store,
+            state,
+            self.city_id,
+            city,
+            new_deputy_id=0,
+        )
+        await _send_interaction_card(
+            interaction,
+            kind="notification" if ok else "warning",
+            title="✅ Заместитель снят" if ok else "❌ Изменение не выполнено",
+            description=text,
+            state=state,
+            city=city,
+            followup=True,
+            color=0x59B77A if ok else 0xD85C5C,
+        )
 
 
 class CityCitizenRemoveSelect(discord.ui.Select):
@@ -3294,7 +3936,7 @@ class CityCitizenRemoveSelect(discord.ui.Select):
                 state,
                 title="➖ Удалены горожане",
                 description=(
-                    f"Мэр: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
+                    f"Инициатор: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
                     f"Удалены: {', '.join(f'<@{user_id}> (`{user_id}`)' for user_id in removed)}.\n"
                     f"Осталось в списке: **{len(_citizen_ids(city))}**.\n"
                     f"Синхронизация: {sync_text}"
@@ -3346,26 +3988,10 @@ class CityCitizenRemoveView(discord.ui.View):
         self.next_page.disabled = self.page >= self.page_count - 1
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.guild is None or interaction.user.id != self.mayor_id:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Нет доступа",
-                description="Эта панель списка горожан открыта другому мэру.",
-            )
+        state, city = await _management_guard(interaction, self.store, self.city_id, self.mayor_id)
+        if state is None or city is None:
             return False
         self.guild = interaction.guild
-        state = self.store.get(interaction.guild.id)
-        city = state.cities.get(self.city_id) if state else None
-        if city is None or _mayor_id(city) != interaction.user.id:
-            await _send_interaction_card(
-                interaction,
-                kind="warning",
-                title="❌ Доступ изменился",
-                description="Вы больше не управляете этим городом.",
-                state=state,
-            )
-            return False
         return True
 
     @discord.ui.button(label="Назад", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
@@ -3397,9 +4023,9 @@ async def _management_guard(
     interaction: discord.Interaction,
     store: UnifiedDiscordStore,
     city_id: str,
-    mayor_id: int,
+    actor_id: int,
 ) -> tuple[UnifiedState | None, dict[str, Any] | None]:
-    if interaction.guild is None or interaction.user.id != mayor_id:
+    if interaction.guild is None or interaction.user.id != actor_id:
         await _send_interaction_card(
             interaction,
             kind="warning",
@@ -3409,13 +4035,30 @@ async def _management_guard(
         return None, None
     state = store.get(interaction.guild.id)
     city = state.cities.get(city_id) if state else None
-    if state is None or city is None or city.get("status") != "approved" or _mayor_id(city) != mayor_id:
+    if state is None or city is None or city.get("status") != "approved":
         await _send_interaction_card(
             interaction,
             kind="warning",
             title="❌ Город недоступен",
-            description="Город не найден или руководство было изменено администрацией.",
+            description="Город не найден или больше не находится в активном статусе.",
             state=state,
+        )
+        return None, None
+    is_mayor = _mayor_id(city) == interaction.user.id
+    is_staff = _is_city_staff_member(
+        interaction.user,
+        interaction.guild,
+        state,
+        getattr(store.bot, "admin_user_ids", set()),
+    )
+    if not is_mayor and not is_staff:
+        await _send_interaction_card(
+            interaction,
+            kind="warning",
+            title="❌ Нет прав управления",
+            description="Управлять этим городом может его мэр или настроенная администрация.",
+            state=state,
+            city=city,
         )
         return None, None
     return state, city
@@ -3729,12 +4372,16 @@ async def _send_leadership_service_message(
     if thread is None:
         return
     label = "мэра" if leader_type == "mayor" else "заместителя мэра"
+    actor_is_mayor = moderator_id == _mayor_id(city) and leader_type == "deputy"
+    actor_label = "Мэр изменил" if actor_is_mayor else "Администрация изменила"
+    old_text = f"<@{old_id}> (`{old_id}`)" if old_id else "Не был назначен"
+    new_text = f"<@{new_id}> (`{new_id}`)" if new_id else "Не назначен"
     embed = _simple_embed(
         "🔄 Изменение руководства города",
         (
-            f"Администрация изменила {label} города **{city.get('name', city_id)}**.\n\n"
-            f"**Предыдущий руководитель:** <@{old_id}> (`{old_id}`)\n"
-            f"**Новый руководитель:** <@{new_id}> (`{new_id}`)\n"
+            f"{actor_label} {label} города **{city.get('name', city_id)}**.\n\n"
+            f"**Предыдущий руководитель:** {old_text}\n"
+            f"**Новый руководитель:** {new_text}\n"
             f"**Изменение выполнил:** <@{moderator_id}> (`{moderator_id}`)"
         ),
         color=0x5865F2,
@@ -3776,10 +4423,15 @@ async def _replace_city_leader(
         return False, f"Выбранный пользователь уже связан с другим городом `{other_city[0]}`."
 
     previous = copy.deepcopy(city)
+    citizens = _citizen_ids(city)
     new_mayor = new_member.id if leader_type == "mayor" else old_mayor
     new_deputy = new_member.id if leader_type == "deputy" else old_deputy
+    if leader_type == "deputy":
+        if old_deputy and old_deputy != new_member.id and old_deputy not in citizens:
+            citizens.append(old_deputy)
+        citizens = [user_id for user_id in citizens if user_id != new_member.id]
     _set_leaders(city, new_mayor, new_deputy)
-    _set_citizen_ids(city, _citizen_ids(city))
+    _set_citizen_ids(city, citizens)
     _set_citizen_absent_ids(city, _citizen_absent_ids(city))
     city[f"{leader_type}Present"] = True
     city[f"{leader_type}_present"] = True
@@ -4145,8 +4797,8 @@ async def _publish_city_panels_locked(
         if kind == "application":
             title = "🏰 Регистрация города"
             body = (
-                "Заполните заявку на регистрацию города и укажите руководство, стиль, координаты, описание, "
-                "а также первые скриншоты построек. После отправки заявка попадёт в закрытый канал администрации."
+                "Заявитель автоматически становится мэром будущего города. Заполните название, стиль, координаты, "
+                "описание и приложите первые скриншоты построек. Заместитель назначается позже из принятых горожан."
             )
             footer = "FunFernus • Подача заявок на регистрацию города"
             controls = CityApplicationPanelView(bot, store)
@@ -4613,6 +5265,519 @@ class CityBannerKindView(CityTransientView):
         self.add_item(CityBannerKindSelect(bot, store))
 
 
+class CityAdminCitySelect(discord.ui.Select):
+    def __init__(self, owner: "CityAdminCityListView", city_ids: list[str]) -> None:
+        options: list[discord.SelectOption] = []
+        state = owner.store.get(owner.guild_id)
+        for city_id in city_ids:
+            city = state.cities.get(city_id, {}) if state else {}
+            status = str(city.get("status", "unknown"))
+            options.append(
+                discord.SelectOption(
+                    label=_trim(str(city.get("name", city_id)), 90),
+                    value=city_id,
+                    description=_trim(f"{city_id} • {_status_text(status)}", 100),
+                    emoji="🏰" if status == "approved" else "🕓",
+                )
+            )
+        super().__init__(
+            placeholder="Выберите город для управления",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+        self.owner = owner
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return
+        state = self.owner.store.get(interaction.guild.id)
+        city_id = self.values[0]
+        city = state.cities.get(city_id) if state else None
+        if state is None or city is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Город не найден",
+                description="Запись была удалена или изменилась. Откройте список заново.",
+                state=state,
+            )
+            return
+        if city.get("status") != "approved":
+            embed = city_review_embed(city_id, city, state)
+            embed.title = f"🛡️ Административный просмотр • {city.get('name', city_id)}"
+            embed.description = (
+                f"Текущий статус: **{_status_text(str(city.get('status')))}**. "
+                "Полное управление составом доступно после одобрения города."
+            )
+            layout, file = _message_payload(
+                "setup",
+                embed,
+                city=city,
+                state=state,
+                controls=CityAdminInactiveCityView(
+                    self.owner.bot,
+                    self.owner.store,
+                    city_id,
+                    interaction.user.id,
+                ),
+            )
+        else:
+            embed = city_management_embed(city_id, city, state)
+            embed.title = f"🛡️ Административное управление • {city.get('name', city_id)}"
+            embed.description = (
+                "Администрация может изменить данные, состав, руководство, публикацию и удалить город. "
+                "Все проверки выполняются по Discord ID."
+            )
+            layout, file = _message_payload(
+                "setup",
+                embed,
+                city=city,
+                state=state,
+                controls=CityAdminManagementView(
+                    self.owner.bot,
+                    self.owner.store,
+                    city_id,
+                    interaction.user.id,
+                ),
+            )
+        await interaction.response.send_message(
+            view=layout,
+            file=file,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class CityAdminCityListView(CityTransientView):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        guild_id: int,
+        requester_id: int,
+        *,
+        page: int = 0,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.store = store
+        self.guild_id = guild_id
+        self.requester_id = requester_id
+        state = store.get(guild_id)
+        city_ids = sorted(state.cities.keys()) if state else []
+        self.page_count = max(1, (len(city_ids) + 24) // 25)
+        self.page = min(max(page, 0), self.page_count - 1)
+        page_ids = city_ids[self.page * 25 : (self.page + 1) * 25]
+        if page_ids:
+            self.add_item(CityAdminCitySelect(self, page_ids))
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.page_count - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or interaction.user.id != self.requester_id:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Этот список городов открыт другому администратору.",
+            )
+            return False
+        state = self.store.get(interaction.guild.id)
+        if state is None or not _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        ):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет прав управления городами",
+                description="Ваши административные права были изменены.",
+                state=state,
+            )
+            return False
+        return True
+
+    async def _change_page(self, interaction: discord.Interaction, page: int) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        if state is None:
+            return
+        city_count = len(state.cities)
+        page_count = max(1, (city_count + 24) // 25)
+        page = min(max(page, 0), page_count - 1)
+        view = CityAdminCityListView(
+            self.bot,
+            self.store,
+            interaction.guild.id,
+            self.requester_id,
+            page=page,
+        )
+        embed = discord.Embed(
+            title="🏰 Список городов",
+            description=(
+                f"Всего записей: **{city_count}**. Выберите город, чтобы открыть его административное управление."
+            ),
+            color=int(state.options.get("accent_color", 0x19B9D1)),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text=f"FunFernus • Города • Страница {page + 1}/{page_count}")
+        layout, file = _message_payload("setup", embed, state=state, controls=view)
+        await interaction.response.edit_message(
+            content=None,
+            embeds=[],
+            attachments=[file],
+            view=layout,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(label="Назад", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._change_page(interaction, self.page - 1)
+
+    @discord.ui.button(label="Далее", emoji="➡️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._change_page(interaction, self.page + 1)
+
+
+class CityAdminInactiveCityView(CityTransientView):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or interaction.user.id != self.requester_id:
+            return False
+        state = self.store.get(interaction.guild.id)
+        return state is not None and _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        )
+
+    @discord.ui.button(label="Удалить запись", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def delete(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        city = state.cities.get(self.city_id) if state else None
+        if state is None or city is None:
+            return
+        if not _is_core_admin(interaction.user, interaction.guild, getattr(self.bot, "admin_user_ids", set())):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Недостаточно прав",
+                description="Полностью удалять города может только владелец сервера или основной администратор.",
+                state=state,
+                city=city,
+            )
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="warning",
+            title=f"🗑️ Удалить {city.get('name', self.city_id)}?",
+            description="Будут удалены запись, сообщения, публикация и локальные изображения города.",
+            state=state,
+            city=city,
+            view=CityDeleteConfirmView(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+                getattr(self.bot, "admin_user_ids", set()),
+            ),
+            color=0xD85C5C,
+        )
+
+
+class CityAdminManagementView(CityTransientView):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: UnifiedDiscordStore,
+        city_id: str,
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.store = store
+        self.city_id = city_id
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or interaction.user.id != self.requester_id:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Эта административная панель открыта другому пользователю.",
+            )
+            return False
+        state = self.store.get(interaction.guild.id)
+        if state is None or not _is_city_staff_member(
+            interaction.user,
+            interaction.guild,
+            state,
+            getattr(self.bot, "admin_user_ids", set()),
+        ):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет прав управления",
+                description="Ваш доступ к административному управлению городами был отозван.",
+                state=state,
+            )
+            return False
+        return True
+
+    def _city(self, interaction: discord.Interaction) -> tuple[UnifiedState | None, dict[str, Any] | None]:
+        state = self.store.get(interaction.guild.id) if interaction.guild else None
+        return state, state.cities.get(self.city_id) if state else None
+
+    @discord.ui.button(label="Название", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def rename(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state, city = self._city(interaction)
+        if city is None:
+            return
+        await interaction.response.send_modal(
+            CityRenameModal(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+                current_name=str(city.get("name", "")),
+            )
+        )
+
+    @discord.ui.button(label="Описание", emoji="📝", style=discord.ButtonStyle.primary)
+    async def description(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state, city = self._city(interaction)
+        if city is None:
+            return
+        await interaction.response.send_modal(
+            CityDescriptionModal(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+                current_description=str(city.get("description", "")),
+            )
+        )
+
+    @discord.ui.button(label="Баннер", emoji="🖼️", style=discord.ButtonStyle.success)
+    async def banner(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(
+            CityBannerModal(self.bot, self.store, self.city_id, interaction.user.id)
+        )
+
+    @discord.ui.button(label="Координаты", emoji="🧭", style=discord.ButtonStyle.secondary)
+    async def data(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state, city = self._city(interaction)
+        if city is None:
+            return
+        await interaction.response.send_modal(
+            CityEditDataModal(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+                current_city=city,
+            )
+        )
+
+    @discord.ui.button(label="Пригласить", emoji="📨", style=discord.ButtonStyle.success)
+    async def invite(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state, city = self._city(interaction)
+        if state is None or city is None:
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="management",
+            title="📨 Пригласить игрока",
+            description="Игрок станет горожанином только после принятия приглашения в личных сообщениях.",
+            state=state,
+            city=city,
+            view=CityCitizenAddView(self.bot, self.store, self.city_id, interaction.user.id),
+        )
+
+    @discord.ui.button(label="Исключить", emoji="➖", style=discord.ButtonStyle.danger)
+    async def remove(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state, city = self._city(interaction)
+        if state is None or city is None:
+            return
+        if not _citizen_ids(city):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="ℹ️ Список горожан пуст",
+                description="Исключать пока некого.",
+                state=state,
+                city=city,
+            )
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="management",
+            title="➖ Исключение горожан",
+            description="Выберите участников, которых необходимо исключить из города.",
+            state=state,
+            city=city,
+            view=CityCitizenRemoveView(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+                page=0,
+                guild=interaction.guild,
+            ),
+        )
+
+    @discord.ui.button(label="Заместитель", emoji="🛡️", style=discord.ButtonStyle.primary)
+    async def deputy(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state, city = self._city(interaction)
+        if state is None or city is None:
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="leadership",
+            title="🛡️ Назначение заместителя из горожан",
+            description="Выберите принятого горожанина либо снимите текущего заместителя.",
+            state=state,
+            city=city,
+            view=CityDeputyManagementView(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+                bool(_deputy_id(city)),
+            ),
+        )
+
+    @discord.ui.button(label="Горожане", emoji="👥", style=discord.ButtonStyle.secondary)
+    async def citizens(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state, city = self._city(interaction)
+        if state is None or city is None:
+            return
+        embed = city_citizens_embed(self.city_id, city, interaction.guild, state, page=0)
+        layout, file = _message_payload(
+            "management",
+            embed,
+            city=city,
+            state=state,
+            controls=CityCitizenListView(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+                page=0,
+                total=len(_citizen_ids(city)),
+            ),
+        )
+        await interaction.response.send_message(
+            view=layout,
+            file=file,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(label="Приглашения", emoji="✉️", style=discord.ButtonStyle.secondary)
+    async def invitations(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state, city = self._city(interaction)
+        if state is None or city is None:
+            return
+        invitations = _pending_invitations(city)
+        layout, file = _message_payload(
+            "management",
+            city_invitations_embed(self.city_id, city, state),
+            city=city,
+            state=state,
+            controls=CityInvitationManagementView(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+                invitations,
+            ),
+        )
+        await interaction.response.send_message(
+            view=layout,
+            file=file,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(label="Руководство", emoji="👑", style=discord.ButtonStyle.secondary)
+    async def leadership(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state, city = self._city(interaction)
+        if state is None or city is None:
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="leadership",
+            title="👑 Административная смена руководства",
+            description="Здесь администрация может принудительно заменить мэра или заместителя по Discord ID.",
+            state=state,
+            city=city,
+            view=CityLeadershipAdminView(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+            ),
+        )
+
+    @discord.ui.button(label="Удалить город", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def delete(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state, city = self._city(interaction)
+        if state is None or city is None:
+            return
+        if not _is_core_admin(interaction.user, interaction.guild, getattr(self.bot, "admin_user_ids", set())):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Недостаточно прав",
+                description="Полностью удалять города может только владелец сервера или основной администратор.",
+                state=state,
+                city=city,
+            )
+            return
+        await _send_interaction_card(
+            interaction,
+            kind="warning",
+            title=f"🗑️ Удалить {city.get('name', self.city_id)}?",
+            description="Будут удалены запись, публикация, сообщения и локальные изображения города.",
+            state=state,
+            city=city,
+            view=CityDeleteConfirmView(
+                self.bot,
+                self.store,
+                self.city_id,
+                interaction.user.id,
+                getattr(self.bot, "admin_user_ids", set()),
+            ),
+            color=0xD85C5C,
+        )
+
+
 class CitySetupView(discord.ui.View):
     def __init__(self, bot: commands.Bot, store: UnifiedDiscordStore) -> None:
         super().__init__(timeout=900)
@@ -4647,6 +5812,44 @@ class CitySetupView(discord.ui.View):
             )
             return False
         return True
+
+    @discord.ui.button(label="Список городов", emoji="🏙️", style=discord.ButtonStyle.success)
+    async def city_list(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            return
+        state = self.store.get(interaction.guild.id)
+        if state is None:
+            return
+        city_count = len(state.cities)
+        embed = discord.Embed(
+            title="🏰 Список городов",
+            description=(
+                f"Всего записей: **{city_count}**. Выберите город, чтобы открыть его административную панель управления."
+                if city_count
+                else "В хранилище пока нет городов и заявок."
+            ),
+            color=int(state.options.get("accent_color", 0x19B9D1)),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="FunFernus • Конфигурация • Управление городами")
+        layout, file = _message_payload(
+            "setup",
+            embed,
+            state=state,
+            controls=CityAdminCityListView(
+                self.bot,
+                self.store,
+                interaction.guild.id,
+                interaction.user.id,
+                page=0,
+            ),
+        )
+        await interaction.response.send_message(
+            view=layout,
+            file=file,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @discord.ui.button(label="Каналы", emoji="📍", style=discord.ButtonStyle.secondary)
     async def channels(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -5429,7 +6632,11 @@ async def _delete_city_everywhere(
             f"Администратор: <@{interaction.user.id}> (`{interaction.user.id}`).\n"
             f"Название: **{snapshot.get('name', normalized_id)}**.\n"
             f"Мэр: <@{mayor_id}> (`{mayor_id}`).\n"
-            f"Заместитель: <@{_deputy_id(snapshot)}> (`{_deputy_id(snapshot)}`).\n"
+            + (
+                f"Заместитель: <@{_deputy_id(snapshot)}> (`{_deputy_id(snapshot)}`).\n"
+                if _deputy_id(snapshot)
+                else "Заместитель: не был назначен.\n"
+            )
             + (f"Предупреждения: {_trim('; '.join(errors), 1200)}" if errors else "Все связанные данные удалены без дополнительных ошибок.")
         ),
         city_id=normalized_id,
@@ -5524,6 +6731,7 @@ async def setup_cities(bot: commands.Bot, store: UnifiedDiscordStore, admin_ids:
     bot.add_view(CityApplicationPanelView(bot, store))
     bot.add_view(CityReviewView(bot, store))
     bot.add_view(CityManagementLauncherView(bot, store))
+    bot.add_view(CityInvitationView(bot, store))
 
     @bot.tree.command(name="настроить_города", description="Настроить регистрацию, реестр и управление городами")
     @app_commands.guild_only()
