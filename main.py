@@ -2422,6 +2422,66 @@ async def rcon_test(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(
+    name="очистить_лс",
+    description="Удалить все сообщения бота в ЛС с указанным пользователем",
+)
+@app_commands.describe(user_id="Discord ID пользователя")
+@app_commands.guild_only()
+async def clear_bot_dm_messages(interaction: discord.Interaction, user_id: str) -> None:
+    """Administratively remove only this bot's messages from one DM channel."""
+    if not await require_staff(interaction):
+        return
+
+    raw_user_id = user_id.strip()
+    if not re.fullmatch(r"\d{15,22}", raw_user_id):
+        await interaction.response.send_message(
+            "❌ Укажите корректный Discord ID пользователя.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    target_id = int(raw_user_id)
+    try:
+        target_user = bot.get_user(target_id) or await bot.fetch_user(target_id)
+        dm_channel = target_user.dm_channel or await target_user.create_dm()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+        await interaction.edit_original_response(
+            content=f"❌ Не удалось открыть ЛС с пользователем `{target_id}`: `{exc}`"
+        )
+        return
+
+    if bot.user is None:
+        await interaction.edit_original_response(content="❌ Бот ещё не готов к выполнению команды.")
+        return
+
+    deleted_count = 0
+    failed_count = 0
+    try:
+        async for message in dm_channel.history(limit=None, oldest_first=False):
+            if message.author.id != bot.user.id:
+                continue
+            try:
+                await message.delete()
+                deleted_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed_count += 1
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        await interaction.edit_original_response(
+            content=(
+                f"⚠️ Удалено сообщений: **{deleted_count}**. "
+                f"Не удалось дочитать историю ЛС: `{exc}`"
+            )
+        )
+        return
+
+    result = f"✅ Удалено сообщений бота в ЛС с пользователем `{target_id}`: **{deleted_count}**."
+    if failed_count:
+        result += f" Не удалось удалить: **{failed_count}**."
+    await interaction.edit_original_response(content=result)
+
+
+@bot.tree.command(
     name="whoami",
     description="Показать Discord ID и статус доступа",
 )
