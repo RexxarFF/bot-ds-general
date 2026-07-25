@@ -28,6 +28,7 @@ from modules.government import (
     publish_government_panel,
     GovernmentSetupView,
 )
+from modules.cities import setup_cities
 
 
 # ============================================================
@@ -2118,6 +2119,7 @@ class FunFernusBot(commands.Bot):
         self.add_view(ControlPanelView(self))
         await setup_community(self, self.unified_store, ADMIN_USER_IDS)
         await setup_government(self, self.unified_store, ADMIN_USER_IDS)
+        await setup_cities(self, self.unified_store, ADMIN_USER_IDS)
 
         if GUILD_ID:
             guild_object = discord.Object(id=GUILD_ID)
@@ -2190,6 +2192,12 @@ async def on_ready() -> None:
                 await publish_support_panel(bot, bot.unified_store, guild, unified_state)
             if unified_state.channels.get("government_panel") and unified_state.channels.get("government_review"):
                 await publish_government_panel(bot, bot.unified_store, guild, unified_state)
+            # При первом запуске после обновления эта операция также
+            # переписывает старые публичные карточки реестра без внутренних
+            # ID и обновляет подписи к скриншотам. Если настройка городов ещё
+            # не завершена, publish_city_panels просто не публикует панели.
+            if unified_state.channels.get("city_registry"):
+                await publish_city_panels(bot, bot.unified_store, guild, unified_state)
         except Exception:
             log.exception("Не удалось загрузить объединённое хранилище для сервера %s", guild.id)
 
