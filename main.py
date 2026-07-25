@@ -28,11 +28,6 @@ from modules.government import (
     publish_government_panel,
     GovernmentSetupView,
 )
-from modules.cities import (
-    setup_cities,
-    publish_city_panels,
-    send_city_setup_message,
-)
 
 
 # ============================================================
@@ -998,7 +993,7 @@ class ReviewView(discord.ui.View):
                 pass
 
             ok, rcon_response = await run_rcon(
-                f"whitelist add {nickname}"
+                f"noblewl add name {nickname}"
             )
             if not ok:
                 try:
@@ -1538,7 +1533,7 @@ class PanelBannerUploadModal(discord.ui.Modal):
         self.guild_id = guild_id
         self.file_field = discord.ui.Label(
             text="Выберите файл баннера",
-            description="Широкий баннер PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1200×630 или 1600×840.",
+            description="Широкий баннер PNG/JPG/WEBP/GIF до 10 МБ. Рекомендуется 1600×600.",
             component=discord.ui.FileUpload(
                 custom_id="funfernus_panel_banner_file",
                 required=True,
@@ -1572,7 +1567,7 @@ class PanelBannerUploadModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True, thinking=True)
         config_channel = await get_text_channel(self.bot, settings.config_channel_id)
         if config_channel is None:
-            await interaction.edit_original_response(content="❌ Канал bot-config не найден.")
+            await interaction.followup.send("Канал bot-config не найден.", ephemeral=True)
             return
 
         try:
@@ -1582,11 +1577,11 @@ class PanelBannerUploadModal(discord.ui.Modal):
                 file=discord.File(io.BytesIO(data), filename=image.filename),
             )
         except discord.HTTPException as exc:
-            await interaction.edit_original_response(content=f"❌ Не удалось сохранить баннер: `{exc}`")
+            await interaction.followup.send(f"Не удалось сохранить баннер: `{exc}`", ephemeral=True)
             return
 
         if not asset_message.attachments:
-            await interaction.edit_original_response(content="❌ Discord не вернул сохранённое вложение.")
+            await interaction.followup.send("Discord не вернул сохранённое вложение.", ephemeral=True)
             return
 
         old_id = int(settings.banner_asset_message_id or 0)
@@ -1603,9 +1598,7 @@ class PanelBannerUploadModal(discord.ui.Modal):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
-        await interaction.edit_original_response(
-            content="✅ Баннер загружен из файла, сохранён и применён. Индикатор загрузки закрыт."
-        )
+        await interaction.followup.send("Баннер загружен из файла и сохранён в config-канале.", ephemeral=True)
 
 
 class PanelBannerActionView(discord.ui.View):
@@ -2097,16 +2090,6 @@ class UnifiedSetupView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Города", emoji="🏰", style=discord.ButtonStyle.secondary)
-    async def cities(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if interaction.guild is None:
-            return
-        await send_city_setup_message(
-            interaction,
-            self.bot,
-            self.bot.unified_store,
-        )
-
 
 # ============================================================
 # БОТ
@@ -2135,7 +2118,6 @@ class FunFernusBot(commands.Bot):
         self.add_view(ControlPanelView(self))
         await setup_community(self, self.unified_store, ADMIN_USER_IDS)
         await setup_government(self, self.unified_store, ADMIN_USER_IDS)
-        await setup_cities(self, self.unified_store, ADMIN_USER_IDS)
 
         if GUILD_ID:
             guild_object = discord.Object(id=GUILD_ID)
@@ -2162,7 +2144,6 @@ async def unified_setup(interaction: discord.Interaction) -> None:
             "• **Заявки** — анкета, рассмотрение, роли и RCON.\n"
             "• **Сообщество** — поддержка, предложения и приветствие.\n"
             "• **Правительство** — судебные иски и судьи.\n"
-            "• **Города** — заявки, модерация, реестр и управление карточками.\n"
             "• `/публикация` — красивое сообщение с баннером в текущем канале."
         ),
         color=config.COLOR_CONTROL,
@@ -2209,17 +2190,6 @@ async def on_ready() -> None:
                 await publish_support_panel(bot, bot.unified_store, guild, unified_state)
             if unified_state.channels.get("government_panel") and unified_state.channels.get("government_review"):
                 await publish_government_panel(bot, bot.unified_store, guild, unified_state)
-            city_channel_keys = (
-                "city_application",
-                "city_review",
-                "city_registry",
-                "city_management",
-                "city_logs",
-            )
-            if unified_state.cities or any(unified_state.channels.get(key) for key in city_channel_keys):
-                # publish_city_panels также выполняет безопасный аудит старых данных:
-                # проверяет руководителей, публикации и локальные файлы после перезапуска.
-                await publish_city_panels(bot, bot.unified_store, guild, unified_state)
         except Exception:
             log.exception("Не удалось загрузить объединённое хранилище для сервера %s", guild.id)
 
@@ -2419,66 +2389,6 @@ async def rcon_test(interaction: discord.Interaction) -> None:
         ("✅" if ok else "❌") + f" **RCON**\n```{response[:1800]}```",
         ephemeral=True,
     )
-
-
-@bot.tree.command(
-    name="очистить_лс",
-    description="Удалить все сообщения бота в ЛС с указанным пользователем",
-)
-@app_commands.describe(user_id="Discord ID пользователя")
-@app_commands.guild_only()
-async def clear_bot_dm_messages(interaction: discord.Interaction, user_id: str) -> None:
-    """Administratively remove only this bot's messages from one DM channel."""
-    if not await require_staff(interaction):
-        return
-
-    raw_user_id = user_id.strip()
-    if not re.fullmatch(r"\d{15,22}", raw_user_id):
-        await interaction.response.send_message(
-            "❌ Укажите корректный Discord ID пользователя.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    target_id = int(raw_user_id)
-    try:
-        target_user = bot.get_user(target_id) or await bot.fetch_user(target_id)
-        dm_channel = target_user.dm_channel or await target_user.create_dm()
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-        await interaction.edit_original_response(
-            content=f"❌ Не удалось открыть ЛС с пользователем `{target_id}`: `{exc}`"
-        )
-        return
-
-    if bot.user is None:
-        await interaction.edit_original_response(content="❌ Бот ещё не готов к выполнению команды.")
-        return
-
-    deleted_count = 0
-    failed_count = 0
-    try:
-        async for message in dm_channel.history(limit=None, oldest_first=False):
-            if message.author.id != bot.user.id:
-                continue
-            try:
-                await message.delete()
-                deleted_count += 1
-            except (discord.Forbidden, discord.HTTPException):
-                failed_count += 1
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        await interaction.edit_original_response(
-            content=(
-                f"⚠️ Удалено сообщений: **{deleted_count}**. "
-                f"Не удалось дочитать историю ЛС: `{exc}`"
-            )
-        )
-        return
-
-    result = f"✅ Удалено сообщений бота в ЛС с пользователем `{target_id}`: **{deleted_count}**."
-    if failed_count:
-        result += f" Не удалось удалить: **{failed_count}**."
-    await interaction.edit_original_response(content=result)
 
 
 @bot.tree.command(
