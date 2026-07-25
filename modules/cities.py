@@ -303,21 +303,13 @@ def _pending_invitation_preview(city: dict[str, Any], *, limit: int = 10) -> str
     return _trim("\n".join(lines), 1024)
 
 
-def _citizen_preview(
-    city: dict[str, Any],
-    *,
-    limit: int = 15,
-    include_ids: bool = False,
-) -> str:
+def _citizen_preview(city: dict[str, Any], *, limit: int = 15) -> str:
     citizens = _citizen_ids(city)
     if not citizens:
         return "Горожане пока не добавлены."
     absent = _citizen_absent_ids(city)
     lines = [
-        (
-            f"{index}. <@{user_id}>" + (f" — `{user_id}`" if include_ids else "")
-            + (" • ⚠️ покинул сервер" if user_id in absent else "")
-        )
+        f"{index}. <@{user_id}> — `{user_id}`" + (" • ⚠️ покинул сервер" if user_id in absent else "")
         for index, user_id in enumerate(citizens[:limit], 1)
     ]
     if len(citizens) > limit:
@@ -934,16 +926,12 @@ def _status_color(status: str, accent: int) -> int:
     }.get(status, accent)
 
 
-def _leader_text(city: dict[str, Any], leader: str, *, include_id: bool = False) -> str:
+def _leader_text(city: dict[str, Any], leader: str) -> str:
     user_id = _mayor_id(city) if leader == "mayor" else _deputy_id(city)
     present = bool(city.get(f"{leader}Present", city.get(f"{leader}_present", True)))
     if not user_id:
         return "Не назначен"
-    return (
-        f"<@{user_id}>"
-        + (f"\n`ID: {user_id}`" if include_id else "")
-        + ("" if present else "\n⚠️ Покинул сервер")
-    )
+    return f"<@{user_id}>\n`ID: {user_id}`" + ("" if present else "\n⚠️ Покинул сервер")
 
 
 def _registry_status(city: dict[str, Any]) -> str:
@@ -1106,7 +1094,7 @@ async def _user(bot: commands.Bot, user_id: int) -> discord.User | None:
 
 
 def _has_city_invitation_buttons(items: Iterable[Any]) -> bool:
-    """Return whether a Components V2 tree contains an active city invitation."""
+    """Return whether a Components V2 tree contains city invite controls."""
     for item in items:
         if getattr(item, "custom_id", "") in {
             "unified:cities:invitation:accept",
@@ -1120,11 +1108,12 @@ def _has_city_invitation_buttons(items: Iterable[Any]) -> bool:
 
 
 async def _delete_invitation_dm(bot: commands.Bot, invitation: dict[str, Any]) -> bool:
-    """Delete a cancelled invitation, including legacy cards with a lost ID."""
+    """Delete a withdrawn invitation from the invited player's direct messages."""
     user_id = int(invitation.get("userId", invitation.get("user_id", 0)) or 0)
     message_id = int(invitation.get("dmMessageId", invitation.get("dm_message_id", 0)) or 0)
     if not user_id:
         return False
+
     recipient = await _user(bot, user_id)
     if recipient is None:
         return False
@@ -1141,15 +1130,14 @@ async def _delete_invitation_dm(bot: commands.Bot, invitation: dict[str, Any]) -
             await message.delete()
             return True
         except discord.NotFound:
-            # The stored ID may belong to an old message after a bot update.
-            # Continue with a safe component-based lookup below.
+            # The message was already removed, or its saved ID belongs to an
+            # older version of the invitation card.  Check legacy cards too.
             stored_message_missing = True
         except (discord.Forbidden, discord.HTTPException):
             log.warning("Не удалось удалить ЛС-приглашение %s для пользователя %s", message_id, user_id)
 
-    # Old invitations may not have dmMessageId in JSON.  There can be only one
-    # active invitation per player, so deleting bot messages with its active
-    # accept/decline controls is a safe recovery path.
+    # Older records may have no dmMessageId. A player can have only one active
+    # invitation, so deleting bot cards with these exact controls is safe.
     deleted = False
     try:
         async for message in channel.history(limit=100, oldest_first=False):
@@ -1163,13 +1151,11 @@ async def _delete_invitation_dm(bot: commands.Bot, invitation: dict[str, Any]) -
         log.warning("Не удалось найти или удалить старое ЛС-приглашение для пользователя %s", user_id)
         return False
 
-    # If the exact saved message was already absent, there is nothing left to
-    # delete even when the fallback does not find a duplicate.
     return deleted or stored_message_missing
 
 
 def _city_invitation_embed(city: dict[str, Any], invited_by: int) -> discord.Embed:
-    """Build the player-facing invitation without exposing the internal city ID."""
+    """Build the player-facing invitation without the internal city ID."""
     return _simple_embed(
         "🏰 Приглашение в город",
         (
@@ -1243,8 +1229,8 @@ def city_review_embed(city_id: str, city: dict[str, Any], state: UnifiedState) -
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Название", value=_trim(city.get("name")), inline=True)
-    embed.add_field(name="Мэр", value=_leader_text(city, "mayor", include_id=True), inline=True)
-    embed.add_field(name="Заместитель", value=_leader_text(city, "deputy", include_id=True), inline=True)
+    embed.add_field(name="Мэр", value=_leader_text(city, "mayor"), inline=True)
+    embed.add_field(name="Заместитель", value=_leader_text(city, "deputy"), inline=True)
     embed.add_field(name="Архитектурный стиль", value=_trim(city.get("style")), inline=False)
     embed.add_field(name="Координаты • Верхний мир", value=_trim(city.get("overworld_coords")), inline=True)
     embed.add_field(name="Координаты • Нижний мир", value=_trim(city.get("nether_coords")), inline=True)
@@ -1264,11 +1250,7 @@ def city_review_embed(city_id: str, city: dict[str, Any], state: UnifiedState) -
         embed.add_field(name="Ответ мэра", value=_trim(latest.get("answer"), 700, "Ответ ещё не получен."), inline=False)
 
     if status == "approved":
-        embed.add_field(
-            name=f"Горожане • {len(_citizen_ids(city))}",
-            value=_citizen_preview(city, include_ids=True),
-            inline=False,
-        )
+        embed.add_field(name=f"Горожане • {len(_citizen_ids(city))}", value=_citizen_preview(city), inline=False)
         embed.add_field(name="Одобрил", value=f"<@{int(city.get('reviewer_id', 0))}>", inline=True)
         thread_id = _get_message_id(city, "registryThreadId", "registry_thread_id")
         if thread_id:
@@ -1311,8 +1293,7 @@ def city_registry_embed(city_id: str, city: dict[str, Any], state: UnifiedState)
         value="Мэр, заместитель мэра, настроенная администрация и разрешённые боты. Остальные сообщения удаляются автоматически.",
         inline=False,
     )
-    # Реестр доступен обычным участникам, поэтому внутренний ID сюда не выводим.
-    # Он остаётся в карточке рассмотрения и служебном канале логов.
+    # Реестр доступен всем участникам, поэтому внутренний ID здесь не выводится.
     embed.set_footer(text="Официальный реестр FunFernus")
     return embed
 
@@ -1323,7 +1304,7 @@ def city_management_embed(city_id: str, city: dict[str, Any], state: UnifiedStat
     embed = discord.Embed(
         title=f"⚙️ Управление городом • {_trim(city.get('name'), 180)}",
         description=(
-            "Изменения сохраняются по Discord ID и сразу синхронизируются с официальной публикацией. "
+            "Изменения сразу синхронизируются с официальной публикацией. "
             "Мэр приглашает игроков, управляет составом города и назначает одного заместителя из принятых горожан."
         ),
         color=accent,
@@ -1772,14 +1753,13 @@ async def sync_registry_post(
         return False, f"Discord не обновил карточку реестра: {exc}"
 
 
-async def _migrate_public_city_id_visibility(
+async def _migrate_public_city_privacy(
     bot: commands.Bot,
     store: UnifiedDiscordStore,
     state: UnifiedState,
 ) -> None:
-    """Rewrite existing public cards and DMs once after the privacy updates."""
-    # v2 additionally removes public Discord user IDs from city forum cards.
-    migration_key = "city_public_personal_id_visibility_migrated_v2"
+    """Rewrite existing public cards and invitation DMs once after this update."""
+    migration_key = "city_public_privacy_migrated_v1"
     if state.options.get(migration_key):
         return
 
@@ -1787,10 +1767,11 @@ async def _migrate_public_city_id_visibility(
     for city_id, city in state.cities.items():
         if city.get("status") != "approved":
             continue
-        synced, _ = await sync_registry_post(bot, state, city_id, city)
-        # A city without an existing registry post has no public text to clean.
-        if not synced and _get_message_id(city, "registryThreadId", "registry_thread_id"):
-            failed_city_ids.add(city_id)
+
+        if _get_message_id(city, "registryThreadId", "registry_thread_id"):
+            synced, _ = await sync_registry_post(bot, state, city_id, city)
+            if not synced:
+                failed_city_ids.add(city_id)
 
         for invitation in _pending_invitations(city):
             message_id = int(invitation.get("dmMessageId", 0) or 0)
@@ -1812,14 +1793,14 @@ async def _migrate_public_city_id_visibility(
                     view=CityInvitationView(bot, store),
                 )
             except discord.NotFound:
-                # The old player-facing message is already gone.
+                # The old message is already absent and cannot expose an ID.
                 pass
             except (discord.Forbidden, discord.HTTPException):
                 failed_city_ids.add(city_id)
 
     if failed_city_ids:
         log.warning(
-            "Не удалось обновить карточки городов без ID: %s",
+            "Не удалось обновить часть публичных карточек городов без ID: %s",
             ", ".join(sorted(failed_city_ids)),
         )
         return
@@ -1959,7 +1940,7 @@ class CityDetailsModal(discord.ui.Modal):
                 interaction,
                 kind="warning",
                 title="❌ Вы уже состоите в городе",
-                description="Ваш Discord ID уже связан с другим городом.",
+                description=f"Ваш Discord ID уже связан с городом `{occupied[0]}`.",
                 state=state,
             )
             return
@@ -2565,7 +2546,7 @@ class CityReviewView(discord.ui.View):
                 interaction,
                 kind="notification",
                 title="✅ Город одобрен",
-                description=f"Город опубликован в <#{thread.id}>.{tail}",
+                description=f"Город `{city_id}` опубликован в <#{thread.id}>.{tail}",
                 state=state,
                 city=city,
                 followup=True,
@@ -2808,7 +2789,7 @@ class CityQuestionModal(discord.ui.Modal):
                         "Ответьте следующим сообщением в этом личном чате. Файлы можно приложить — бот сохранит их локально."
                     ),
                     color=0x5865F2,
-                    footer="FunFernus • Заявка на город",
+                    footer="FunFernus • Рассмотрение заявки",
                 )
                 await _send_user_card(mayor, kind="notification", embed=dm, state=state, city=city)
             except Exception as exc:
@@ -3318,7 +3299,7 @@ class CityInvitationView(discord.ui.View):
         return None
 
     async def _delete_stale_message(self, interaction: discord.Interaction) -> None:
-        """A withdrawn invitation must not turn into another banner on click."""
+        """Do not replace a withdrawn invitation with an old warning banner."""
         if not interaction.response.is_done():
             await interaction.response.defer()
         message = interaction.message
@@ -3476,7 +3457,7 @@ class CityInvitationView(discord.ui.View):
         await self._finish_message(
             interaction,
             title="✅ Вы вступили в город",
-            description=f"Вы приняты в **{city.get('name', city_id)}**.",
+            description=f"Вы приняты в **{city.get('name', 'город')}**.",
             state=state,
             city=city,
             color=0x59B77A,
@@ -3830,15 +3811,14 @@ class CityInvitationCancelSelect(discord.ui.Select):
             kind="warning" if undeleted_dm_user_ids else "notification",
             title="⚠️ Приглашения отменены не полностью" if undeleted_dm_user_ids else "✅ Приглашения отменены",
             description=(
-                "Приглашения отменены, но бот не смог удалить ЛС у: "
-                + ", ".join(f"<@{user_id}>" for user_id in undeleted_dm_user_ids)
-                + ". Проверьте права бота и повторите отмену."
+                "Приглашения отменены, но бот не смог удалить часть сообщений в личных сообщениях. "
+                "Используйте команду `/очистить_лс_бота` для принудительной очистки."
                 if undeleted_dm_user_ids
-                else f"Отменено приглашений: **{len(removed)}**."
+                else f"Отменено приглашений: **{len(removed)}**. Сообщения в ЛС удалены."
             ),
             state=state,
             city=city,
-            color=0xF2B84B if undeleted_dm_user_ids else 0x59B77A,
+            color=0x59B77A,
         )
 
 
@@ -4548,20 +4528,18 @@ async def _send_leadership_service_message(
     label = "мэра" if leader_type == "mayor" else "заместителя мэра"
     actor_is_mayor = moderator_id == _mayor_id(city) and leader_type == "deputy"
     actor_label = "Мэр изменил" if actor_is_mayor else "Администрация изменила"
-    # Сообщение публикуется в форуме, поэтому показываем пользователей без
-    # технических Discord ID.
-    old_text = f"<@{old_id}>" if old_id else "Не был назначен"
-    new_text = f"<@{new_id}>" if new_id else "Не назначен"
+    old_text = f"<@{old_id}> (`{old_id}`)" if old_id else "Не был назначен"
+    new_text = f"<@{new_id}> (`{new_id}`)" if new_id else "Не назначен"
     embed = _simple_embed(
         "🔄 Изменение руководства города",
         (
             f"{actor_label} {label} города **{city.get('name', city_id)}**.\n\n"
             f"**Предыдущий руководитель:** {old_text}\n"
             f"**Новый руководитель:** {new_text}\n"
-            f"**Изменение выполнил:** <@{moderator_id}>"
+            f"**Изменение выполнил:** <@{moderator_id}> (`{moderator_id}`)"
         ),
         color=0x5865F2,
-        footer="FunFernus • Служебное сообщение",
+        footer=f"FunFernus • {city_id} • Служебное сообщение",
     )
     try:
         await _send_channel_card(thread, kind="leadership", embed=embed, state=state, city=city)
@@ -4920,7 +4898,7 @@ async def publish_city_panels(
         if run_audit:
             await _migrate_legacy_city_assets(bot, store, guild, state)
             await _audit_city_state(bot, store, guild, state, admin_ids)
-            await _migrate_public_city_id_visibility(bot, store, state)
+            await _migrate_public_city_privacy(bot, store, state)
 
         return await _publish_city_panels_locked(
             bot,
@@ -6425,7 +6403,7 @@ async def _handle_city_thread_message(
             "настроенная администрация и разрешённые боты. Проверка выполняется по Discord ID."
         ),
         color=0xD85C5C,
-        footer="FunFernus • Публикация города",
+        footer="FunFernus • Реестр городов",
     )
     try:
         await _send_user_card(message.author, kind="warning", embed=warning, state=state, city=city)
@@ -6792,7 +6770,7 @@ async def _delete_city_everywhere(
             notice = _simple_embed(
                 "🗑️ Город удалён из реестра",
                 (
-                    f"Город **{snapshot.get('name', normalized_id)}** удалён администрацией.\n"
+                    f"Город **{snapshot.get('name', normalized_id)}** (`{normalized_id}`) удалён администрацией.\n"
                     "Публикация реестра, карточка заявки и сохранённые материалы больше не используются."
                 ),
                 color=0xD85C5C,
@@ -6910,6 +6888,17 @@ async def setup_cities(bot: commands.Bot, store: UnifiedDiscordStore, admin_ids:
     bot.add_view(CityManagementLauncherView(bot, store))
     bot.add_view(CityInvitationView(bot, store))
 
+    @bot.listen("on_ready")
+    async def city_privacy_migration_on_ready() -> None:
+        # Existing registry threads and invitations are rewritten once, so the
+        # update also cleans content that was sent before it was installed.
+        for guild in bot.guilds:
+            try:
+                state = store.get(guild.id) or await store.load_or_create(guild)
+                await _migrate_public_city_privacy(bot, store, state)
+            except Exception:
+                log.exception("Не удалось обновить приватность публикаций городов на сервере %s", guild.id)
+
     @bot.tree.command(name="настроить_города", description="Настроить регистрацию, реестр и управление городами")
     @app_commands.guild_only()
     async def cities_setup(interaction: discord.Interaction) -> None:
@@ -6922,6 +6911,97 @@ async def setup_cities(bot: commands.Bot, store: UnifiedDiscordStore, admin_ids:
             )
             return
         await send_city_setup_message(interaction, bot, store)
+
+    @bot.tree.command(
+        name="очистить_лс_бота",
+        description="Удалить все сообщения бота в ЛС с указанным пользователем",
+    )
+    @app_commands.describe(user_id="Discord ID пользователя")
+    @app_commands.guild_only()
+    async def clear_bot_dm(interaction: discord.Interaction, user_id: str) -> None:
+        if interaction.guild is None or not _is_core_admin(interaction.user, interaction.guild, admin_ids):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Нет доступа",
+                description="Команда доступна владельцу сервера и основным администраторам.",
+            )
+            return
+
+        normalized_user_id = user_id.strip()
+        if not re.fullmatch(r"\d{15,25}", normalized_user_id):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Некорректный Discord ID",
+                description="Укажите ID пользователя: от 15 до 25 цифр.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_id = int(normalized_user_id)
+        target = await _user(bot, target_id)
+        if target is None:
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ Пользователь не найден",
+                description="Discord не вернул пользователя с указанным ID.",
+                followup=True,
+            )
+            return
+        try:
+            channel = target.dm_channel or await target.create_dm()
+        except (discord.Forbidden, discord.HTTPException):
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ ЛС недоступны",
+                description="Боту не удалось открыть личные сообщения с этим пользователем.",
+                followup=True,
+            )
+            return
+
+        deleted = 0
+        failed = 0
+        try:
+            async for message in channel.history(limit=None, oldest_first=False):
+                if bot.user is None or message.author.id != bot.user.id:
+                    continue
+                try:
+                    await message.delete()
+                    deleted += 1
+                except discord.NotFound:
+                    # The target message has already disappeared, which is
+                    # equivalent to a successful cleanup for this command.
+                    deleted += 1
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    failed += 1
+                    log.warning("Не удалось удалить сообщение бота %s в ЛС: %s", message.id, exc)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("Не удалось прочитать историю ЛС для очистки: %s", exc)
+            await _send_interaction_card(
+                interaction,
+                kind="warning",
+                title="❌ История ЛС недоступна",
+                description="Discord не дал боту прочитать историю личных сообщений.",
+                followup=True,
+            )
+            return
+
+        await _send_interaction_card(
+            interaction,
+            kind="warning" if failed else "notification",
+            title="⚠️ Очистка ЛС завершена с ошибками" if failed else "✅ ЛС очищены",
+            description=(
+                f"Удалено сообщений бота: **{deleted}**. Не удалось удалить: **{failed}**."
+                if failed
+                else f"Удалено сообщений бота: **{deleted}**."
+            ),
+            followup=True,
+            color=0xF2B84B if failed else 0x59B77A,
+        )
 
     @bot.tree.command(name="город_руководство", description="Открыть административную панель смены мэра и заместителя")
     @app_commands.describe(city_id="ID города, например CITY-0001")
